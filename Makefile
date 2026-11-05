@@ -118,6 +118,10 @@ GAMELIB_ID := $(shell (cat $(GAMELIB_SRCS); echo '$(GENFLAGS)') | (shasum -a 256
 RT_OBJ   := $(patsubst runtime/%.c,$(B)/rt/%.o,$(RT_SRC))
 RTFLAGS  := -O2 -g -fno-strict-aliasing -Wall -Wno-unused-function -Iruntime -Iruntime/nvn -Ithird_party/openxr/include $(DEPINC) $(OSFLAGS)
 CXXFLAGS := -O2 -g -std=c++17 -I$(IMGUI) -I$(IMGUI)/backends -Iruntime -Iruntime/nvn $(DEPINC)
+# Optional runtime-only optimization; game generation flags and ABI stay unchanged.
+RTFLAGS += $(PERF_FLAGS)
+CXXFLAGS += $(PERF_FLAGS)
+LDFLAGS += $(PERF_FLAGS)
 
 all: $(EXE) $(if $(strip $(GEN_SRC)),$(GAMELIB))  # (strip: with no game code yet GEN_SRC is " ", which $(if) counts as set)
 

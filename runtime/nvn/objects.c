@@ -894,6 +894,10 @@ static void set_shaders(Cpu *c, int stride) {
         p->stages[stage].stage = stage;
         p->stages[stage].code_addr = code;
         p->stages[stage].control = control;
+        if(stage==1) {
+            p->stages[stage].fingerprint=nvn_shader_fingerprint((const void *)(uintptr_t)(code+0x30),0x200);
+            p->stages[stage].fingerprint_valid=true;
+        }
         p->stages[stage].const_offset = *(const uint32_t *)(control + 0x700);
         p->stages[stage].const_size = *(const uint32_t *)(control + 0x6FC);
         p->stage_mask |= 1u << stage;
@@ -1020,6 +1024,22 @@ NVN(nvnQueuePresentTexture) {
     }
     bool rq = rq_enabled();
     if (rq) rq_present_throttle();  // (the render thread one frame behind at most)
+#ifndef __APPLE__
+    extern bool vr_simulation_enabled(void);
+    extern uint64_t vr_simulation_deadline(uint64_t now);
+    if(vr_simulation_enabled()) {
+        uint64_t now=plat_now_ns(),deadline=vr_simulation_deadline(now);
+        if(tex && rq) rq_push(RQ_FRAME,tex,deadline);
+        else if(tex) backend_frame_done(tex,deadline);
+        uint64_t wait_at=plat_now_ns();
+        if(deadline>wait_at) {
+            extern __thread uint64_t g_blocked_ns;
+            kernel_block_begin();
+            plat_sleep_until_ns(deadline);
+            g_blocked_ns+=plat_now_ns()-wait_at;
+        }
+    } else
+#endif
     if (interval > 0) {
         extern uint64_t vi_vsync_count(void), vi_wait_vsync(uint64_t target), vi_vsync_time(uint64_t count);
         extern __thread uint64_t g_blocked_ns;

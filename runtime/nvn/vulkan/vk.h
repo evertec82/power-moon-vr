@@ -57,6 +57,9 @@ VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending su
 uint64_t vk_pending_seq(void);        // number the pending submission will get
 void vk_render_lock(void);            // one thread at a time in the renderer (recursive; exec.c)
 void vk_render_unlock(void);
+// Serialize all host access to the graphics queue, including OpenXR calls.
+void vk_queue_lock(void);
+void vk_queue_unlock(void);
 uint64_t vk_completed_seq(void);
 void vk_wait_seq(uint64_t seq);
 void vk_full_barrier(VkCommandBuffer cb);
@@ -123,3 +126,14 @@ VkShaderModule vk_builtin_shader(const char *name);  // internal shaders (clear,
 
 // ---- device / window (device.c)
 void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
+
+// Conservative current-frame shadow-map reuse during serial stereo replay.
+bool vk_vr_share_shadow(NvnTexture *t);
+void vk_vr_shadow_override(int on); // offscreen same-frame comparison only; -1 restores environment
+bool vk_vr_skip_shadow_write(NvnTexture *t);
+
+// Optional folding of full-image eye initialization into attachment load ops.
+void vk_vr_load_clear_scope(bool eligible);
+void vk_vr_load_clear_override(int value);
+bool vk_vr_take_load_clear(NvnTexture *t);
+bool vk_vr_load_clear_enabled(void);

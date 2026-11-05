@@ -10,9 +10,14 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "vr_pacing.h"
+#include "vr_simulation.h"
+#include "vr_frame_metrics.h"
 #include "vr_math.h"
 #include "vr_camera_math.h"
 #include "vr_camera_state.h"
+#include "vr_menu.h"
+#include "vr_first_person.h"
+#include "../../cpu.h"
 #include "../renderer.h"
 extern uint64_t renderer_fence_seq(void);
 extern void renderer_submit(void);
@@ -51,23 +56,76 @@ static VrRateClock refresh_clock;
 static _Atomic int64_t display_period_ns;
 static _Atomic float measured_vr_fps,target_vr_hz;
 static bool multiple_samples,previous_camera_valid;
+static _Atomic bool title_menu_active;
+static bool frame_title_menu;
+void vr_set_title_menu(bool active) {
+    if(active)vr_first_person_frame_begin();
+    bool was=atomic_exchange_explicit(&title_menu_active,active,memory_order_relaxed);
+    if(was!=active && vr_enabled()) LOG("[vr-menu] %s\n",active?"stationary title panel":"gameplay projection");
+}
+static VrFrameMetrics frame_metrics;
+static _Atomic bool first_person_requested,first_person_applied;
+bool vr_first_person_requested(void) {return atomic_load(&first_person_requested);}
+bool vr_first_person_applied(void) {return atomic_load(&first_person_applied);}
+void vr_first_person_frame_begin(void) {atomic_store(&first_person_applied,false);}
+void vr_toggle_first_person(void) {
+    if(!vr_enabled() || atomic_load(&title_menu_active))return;
+    bool old=atomic_load(&first_person_requested);
+    while(!atomic_compare_exchange_weak(&first_person_requested,&old,!old)){}
+    LOG("[vr-view] %s requested\n",old?"third-person":"first-person");
+}
+static uint64_t vr_view_button_mask(void) {
+    static _Atomic uint64_t cached=UINT64_MAX;
+    uint64_t mask=atomic_load(&cached);
+    if(mask==UINT64_MAX) {
+        const char *e=getenv("ODYSSEY_VR_VIEW_BUTTON");
+        mask=e && !strcmp(e,"r3")?UINT64_C(1)<<5:e && !strcmp(e,"off")?0:((UINT64_C(1)<<4)|(UINT64_C(1)<<5));
+        atomic_store(&cached,mask);
+    }
+    return mask;
+}
+void vr_poll_view_buttons(uint64_t buttons) {
+    static bool down;
+    uint64_t mask=vr_view_button_mask();bool held=mask && (buttons&mask)==mask;
+    if(held&&!down)vr_toggle_first_person();
+    down=held;
+}
+uint64_t vr_filter_view_buttons(uint64_t buttons) {
+    return vr_enabled()?buttons&~vr_view_button_mask():buttons;
+}
 static XrPosef previous_head;
 static float previous_projection[16];
 static bool rate_requested(void) {
-    const char *e=getenv("ODYSSEY_VR_RATE");
-    return e && (!strcmp(e,"display")||!strcmp(e,"auto")||!strcmp(e,"on"));
+    static _Atomic int cached=-1;
+    int requested=atomic_load_explicit(&cached,memory_order_relaxed);
+    if(requested<0) {
+        const char *e=getenv("ODYSSEY_VR_RATE");
+        requested=e && (!strcmp(e,"display")||!strcmp(e,"auto")||!strcmp(e,"on"));
+        atomic_store_explicit(&cached,requested,memory_order_relaxed);
+    }
+    return requested;
+}
+bool vr_simulation_enabled(void) {
+    static int on=-1;
+    if(on<0) { const char *e=getenv("ODYSSEY_VR_SIMULATION"); on=e && atoi(e)!=0; }
+    return vr_enabled() && on;
+}
+uint64_t vr_simulation_deadline(uint64_t now) {
+    static VrSimulationClock clock;
+    return vr_simulation_step(&clock,now);
 }
 bool vr_multiple_samples(void) { return multiple_samples; }
+bool vr_shadow_share_allowed(void) { return !multiple_samples && !rate_requested(); }
 bool vr_high_rate_pacing(void) {
     int64_t period=atomic_load(&display_period_ns);
-    return vr_enabled() && rate_requested() && running && period>0;
+    return vr_enabled() && !vr_simulation_enabled() && rate_requested() && running && period>0;
 }
 bool vr_fps(float *submitted,float *target) {
     if(!vr_enabled() || !session) return false;
     *submitted=atomic_load(&measured_vr_fps); *target=atomic_load(&target_vr_hz);
     return true;
 }
-enum {C_MATCH,C_PREP,C_XRWAIT,C_REPLAY,C_GPUWAIT,C_END,C_COUNT};
+enum {C_MATCH,C_PREP,C_XRWAIT,C_REPLAY,C_GPUWAIT,C_END,C_ACQUIRE,C_COPY,C_COUNT};
 static uint64_t cost_ns[C_COUNT],cost_n[C_COUNT];
 static void cost_add(int kind,uint64_t start) { cost_ns[kind]+=SDL_GetTicksNS()-start; cost_n[kind]++; }
 static double cost_ms(int kind) { return cost_n[kind]?(double)cost_ns[kind]/cost_n[kind]/1e6:0; }
@@ -84,9 +142,33 @@ static void rate_stats(bool game,bool rendered,bool blended) {
         LOG("[vr-rate] VR %.1f fps / %.1f Hz target; game %.1f fps; %llu interpolated images; %llu head-motion frames\n",
             images/seconds,(double)atomic_load(&target_vr_hz),games/seconds,(unsigned long long)interpolated,(unsigned long long)motion_frames);
         LOG("[vr-cost] match %.2f ms/game, prepare %.2f ms/image, xrWait %.2f ms/image, replay %.2f ms/eye, gpuWait %.2f ms/image, xrEnd %.2f ms/image\n",cost_ms(C_MATCH),cost_ms(C_PREP),cost_ms(C_XRWAIT),cost_ms(C_REPLAY),cost_ms(C_GPUWAIT),cost_ms(C_END));
+        if(cost_n[C_ACQUIRE]) LOG("[vr-transfer] acquire %.2f ms/eye, copy submit %.2f ms/eye\n",cost_ms(C_ACQUIRE),cost_ms(C_COPY));
+        if(frame_metrics.count) {
+            LOG("[vr-pacing] delivery p50 %.2f p95 %.2f p99 %.2f ms; longest %.2f ms; %u intervals\n",
+                vr_metrics_percentile(&frame_metrics,50),vr_metrics_percentile(&frame_metrics,95),
+                vr_metrics_percentile(&frame_metrics,99),frame_metrics.longest/1e6,frame_metrics.count);
+            vr_metrics_clear(&frame_metrics);
+        }
         memset(cost_ns,0,sizeof cost_ns); memset(cost_n,0,sizeof cost_n);
         since=now; games=images=interpolated=motion_frames=0;
     }
+}
+// The default keeps the confirmed wait-before-release order. The optional
+// OpenXR rendering.adoc: release once commands referencing the image have
+// been submitted; Vulkan OpenXR calls share the externally synchronized queue.
+// Early handoff still retires GPU work before vr_frame returns: no worker and
+// no additional game frame in flight, only xrEndFrame overlaps the GPU tail.
+static bool vr_early_submit(void) {
+    static int enabled=-1;
+    if(enabled<0) { const char *e=getenv("ODYSSEY_VR_EARLY_SUBMIT"); enabled=e && atoi(e)!=0;
+        LOG("[vr] gameplay compositor handoff %s; menu panels wait for GPU completion; serial GPU retirement\n",enabled?"before GPU wait":"after GPU wait"); }
+    return enabled;
+}
+static void vr_wait_pair(uint64_t seq) {
+    if(!seq)return;
+    uint64_t start=SDL_GetTicksNS();
+    renderer_wait_seq(seq);
+    cost_add(C_GPUWAIT,start);
 }
 static bool capture_requested,eye_history_active;
 void vr_request_capture(void) { capture_requested=true; }
@@ -104,7 +186,7 @@ typedef struct { float *key,base[21],last[21]; bool used; } CameraBase;
 static CameraBase camera_base[16];
 static unsigned camera_next;
 void vr_apply_game_camera(float *fields) {
-    if(!vr_enabled()) return;
+    if(!vr_enabled() || atomic_load_explicit(&title_menu_active,memory_order_relaxed)) return;
     // LookAtCamera contains a row-major view matrix and position/target/up vectors.
     float base[21],out[21]; memcpy(base,fields,sizeof base);
     pthread_mutex_lock(&camera_lock);
@@ -116,17 +198,33 @@ void vr_apply_game_camera(float *fields) {
     if(entry && entry->used && !memcmp(base+12,entry->last+12,9*sizeof(float))) memcpy(base,entry->base,sizeof base);
     XrPosef h=native_head;
     pthread_mutex_unlock(&camera_lock);
+    float original_base[21];memcpy(original_base,base,sizeof base);
+    bool fp=false;
+    if(vr_first_person_requested()) {
+        extern Cpu *kernel_current_cpu(void);
+        extern bool odyssey_vr_player_eye(Cpu *,float *,float *,float *);
+        Cpu *cpu=kernel_current_cpu();float eye_pos[3],up[3],front[3],fp_base[21];
+        if(cpu && odyssey_vr_player_eye(cpu,eye_pos,up,front) &&
+           vr_first_person_base(fp_base,base,eye_pos,up,front)) {
+            memcpy(base,fp_base,sizeof base);fp=true;
+        }
+    }
     if(!vr_lookat_head(out,base,h,scale)) return;
+    extern void odyssey_vr_camera_visibility(Cpu *,bool);
+    Cpu *view_cpu=kernel_current_cpu();
+    if(view_cpu)odyssey_vr_camera_visibility(view_cpu,fp);
+    bool was_fp=atomic_exchange(&first_person_applied,fp);
+    if(was_fp!=fp)LOG("[vr-view] %s camera applied\n",fp?"first-person":"third-person");
     memcpy(fields,out,sizeof out);
     pthread_mutex_lock(&camera_lock);
     applied_head=h;
-    if(entry) { memcpy(entry->base,base,sizeof base); memcpy(entry->last,fields,sizeof base); entry->used=true; }
+    if(entry) { memcpy(entry->base,original_base,sizeof original_base); memcpy(entry->last,fields,sizeof base); entry->used=true; }
     pthread_mutex_unlock(&camera_lock);
     static bool logged;
     if(!logged) { logged=true; LOG("[vr] native LookAtCamera head tracking active\n"); }
 }
 bool vr_camera_target(float *fovy,float *aspect) {
-    if(!vr_enabled()) return false;
+    if(!vr_enabled() || atomic_load_explicit(&title_menu_active,memory_order_relaxed)) return false;
     pthread_mutex_lock(&camera_lock);
     *fovy=wanted_fovy; *aspect=wanted_aspect;
     pthread_mutex_unlock(&camera_lock);
@@ -154,6 +252,7 @@ void vr_camera_snapshot(VrCameraState *out) {
     memset(out,0,sizeof *out);
     pthread_mutex_lock(&camera_lock);
     out->valid=game_camera.valid;
+    out->title_menu=atomic_load_explicit(&title_menu_active,memory_order_relaxed);
     out->fovy=game_camera.fovy; out->aspect=game_camera.aspect;
     out->nearz=game_camera.nearz; out->farz=game_camera.farz;
     memcpy(out->orientation,&applied_head.orientation,sizeof out->orientation);
@@ -168,6 +267,7 @@ static void freeze_projection(void) {
     VrCameraState state;
     if(rq_on_thread() && have_queued_camera) state=queued_camera;
     else vr_camera_snapshot(&state);
+    frame_title_menu=state.title_menu;
     pthread_mutex_lock(&camera_lock);
     bool valid=state.valid;
     float fy=valid?state.fovy:wanted_fovy;
@@ -194,9 +294,16 @@ static bool xr_ok(XrResult r, const char *what) {
 int vr_eye_index(void) { return eye; }
 bool vr_filter_effects(void) {
     if(eye<0) return false;
-    if(offscreen_check && eye==0 && getenv("ODYSSEY_VR_CHECK_NEUTRAL_LEFT")) return false;
-    const char *e=getenv("ODYSSEY_VR_EFFECTS");
-    return e && !strcmp(e,"compatible");
+    // Process options are fixed at launch; avoid CRT environment searches
+    // in every draw of both eyes.
+    static int compatible=-1,neutral_left;
+    if(compatible<0) {
+        const char *e=getenv("ODYSSEY_VR_EFFECTS");
+        compatible=e && !strcmp(e,"compatible");
+        neutral_left=getenv("ODYSSEY_VR_CHECK_NEUTRAL_LEFT")!=NULL;
+    }
+    if(offscreen_check && eye==0 && neutral_left) return false;
+    return compatible;
 }
 bool vr_enabled(void) { return enabled && !failed; }
 
@@ -372,7 +479,7 @@ static float eye_clip_cache[2][2][16];
 static bool eye_clip_valid[2][2];
 void vr_eye_replay_begin(void) { memset(eye_clip_valid,0,sizeof eye_clip_valid); }
 void vr_clip_matrix(float out[16],bool world,bool flip_y,bool depth_minus_one,const void *uniforms,uint64_t bytes) {
-    if(eye<0) { vr_identity(out); return; }
+    if(eye<0 || frame_title_menu) { vr_identity(out); return; }
     if(!eye_clip_valid[world][flip_y]) {
         vr_clip_matrix_uncached(eye_clip_cache[world][flip_y],world,flip_y,depth_minus_one,uniforms,bytes);
         eye_clip_valid[world][flip_y]=true;
@@ -402,16 +509,58 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
     return true;
 }
 
-void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
-    if(!frame) return;
+bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t deadline) {
+    if(!frame) return false;
+    static unsigned consecutive_skips;
+    static uint64_t skipped;
+    bool simulation=vr_simulation_enabled();
+    rate_stats(true,false,false);
+    if(simulation) {
+        static uint64_t debt_budget;
+        if(!debt_budget) {
+            const char *e=getenv("ODYSSEY_VR_RENDER_DEBT_MS");
+            double ms=e?strtod(e,NULL):2.0;
+            if(!isfinite(ms) || ms<2 || ms>33.34)ms=2.0;
+            debt_budget=(uint64_t)(ms*1e6);
+            LOG("[vr-sim] bounded render debt %.3f ms\n",debt_budget/1e6);
+        }
+        bool late=vr_simulation_late_budget(plat_now_ns(),deadline,debt_budget);
+        // Keep servicing OpenXR during sustained overload. A skipped visual frame
+        // stays with the compositor under its original submitted projection pose.
+        if(late && consecutive_skips<6 && !capture_requested) {
+            consecutive_skips++; skipped++;
+            interp_frame_drop(frame);
+            previous_camera_valid=false; previous_head_motion=false;
+            if(eye_history_active) { extern void vk_vr_history_reset(void); vk_vr_history_reset(); }
+            eye_history_active=false;
+            if(skipped%60==1) LOG("[vr-sim] skipped %llu stereo frames to catch up simulation\n",(unsigned long long)skipped);
+            return true;
+        }
+        consecutive_skips=0;
+    }
+    // Offscreen-only deterministic overload for an A/B test with the real game.
+    if(offscreen_check) {
+        const char *cost=getenv("ODYSSEY_VR_TEST_COST_MS");
+        extern uint64_t renderer_present_count(void);
+        if(cost && renderer_present_count()>=1800) {
+            int ms=atoi(cost); if(ms>0 && ms<=100) SDL_Delay((Uint32)ms);
+        }
+    }
     bool completed=false;
     freeze_projection();
+    static bool previous_title_menu;
+    if(previous_title_menu!=frame_title_menu) {
+        extern void vk_vr_history_reset(void);
+        vk_vr_history_reset();
+        eye_history_active=false;previous_camera_valid=false;
+        previous_title_menu=frame_title_menu;
+    }
     XrPosef simulation_head=frame_head;
     unsigned check_samples=1;
     const char *sample_env=getenv("ODYSSEY_VR_CHECK_SAMPLES");
     if(offscreen_check && sample_env && atoi(sample_env)>1) check_samples=(unsigned)atoi(sample_env);
     if(check_samples>4) check_samples=4;
-    bool high_rate=rate_requested() && !offscreen_check;
+    bool high_rate=rate_requested() && !offscreen_check && !simulation && !frame_title_menu;
     multiple_samples=high_rate || check_samples>1;
     bool blend=false;
     bool head_motion=previous_camera_valid && vr_head_changed(previous_head,simulation_head);
@@ -428,7 +577,6 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
     if(!previous_camera_valid) blend=false;
     for(int i=0;i<16;i++)
         if(fabsf(frame_projection[i]-previous_projection[i])>.0001f) blend=false;
-    rate_stats(true,false,false);
     if(offscreen_check) {
         extern uint64_t renderer_present_count(void);
         unsigned long at=strtoul(getenv("ODYSSEY_VR_OFFSCREEN_CHECK"),NULL,10);
@@ -436,18 +584,52 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
         const char *count_env=getenv("ODYSSEY_VR_CHECK_FRAMES");
         if(count_env && strtoul(count_env,NULL,10)>0) count=strtoul(count_env,NULL,10);
         bool capture = renderer_present_count()>=at;
-        if(renderer_present_count()+30>=at) {
+        bool save_capture=capture && !getenv("ODYSSEY_VR_BENCH_NO_CAPTURE");
+        const char *bench_env=getenv("ODYSSEY_VR_BENCH_START");
+        uint64_t bench_start=bench_env?strtoull(bench_env,NULL,10):UINT64_MAX;
+        if(renderer_present_count()+30>=at || renderer_present_count()>=bench_start) {
+            static int clear_ab=-1;
+            if(clear_ab<0)clear_ab=getenv("ODYSSEY_VR_BENCH_CLEAR_AB")!=NULL;
+            int bench_variant=-1;
+            if(clear_ab && renderer_present_count()>=bench_start) {
+                uint64_t f=renderer_present_count();
+                // ABBA balances both even/odd game passes in a single run.
+                bench_variant=(int)((f^(f>>1))&1);
+                vk_vr_load_clear_override(bench_variant);
+            }
+            uint64_t bench_at=SDL_GetTicksNS(),bench_cpu=0;
             extern void renderer_save_texture_tex(TexBackend *,const char *);
             extern TexBackend *vk_tex_replayed(NvnTexture *);
             extern uint32_t g_interp_replay_epoch;
-            if(capture) renderer_save_texture_tex(vk_tex(texture,true),"build/vr_reference.png");
+            if(save_capture) renderer_save_texture_tex(vk_tex(texture,true),"build/vr_reference.png");
+            bool compare_clear=getenv("ODYSSEY_VR_COMPARE_CLEAR")!=NULL;
+            if(save_capture && (compare_clear || getenv("ODYSSEY_VR_COMPARE_SHADOW"))) {
+                bool saved_multiple=multiple_samples;
+                multiple_samples=false; interp_use_current();
+                for(int mode=0;mode<2;mode++) {
+                    extern void vk_vr_history_reset(void);
+                    vk_vr_history_reset();
+                    if(compare_clear) vk_vr_load_clear_override(mode);
+                    else vk_vr_shadow_override(mode?1:0);
+                    for(int i=0;i<2;i++) if(interp_replay_lock()) {
+                        eye=i; g_interp_replay_epoch=epoch;
+                        renderer_interp_replay(); interp_replay_report();
+                        char path[128];snprintf(path,sizeof path,"build/vr_%s_%d_%c.png",compare_clear?"clear":"shadow",mode,i?'R':'L');
+                        renderer_save_texture_tex(vk_tex_replayed(texture),path);
+                        interp_replay_unlock();
+                    }
+                }
+                vk_vr_shadow_override(-1); vk_vr_load_clear_override(-1); multiple_samples=saved_multiple;
+                LOG("[vr-check] same-frame %s A/B capture complete\n",compare_clear?"clear":"shadow");
+            }
             for(unsigned sample=0;sample<check_samples;sample++) {
                 float alpha=(sample+.5f)/check_samples;
                 bool prepared=check_samples>1 && blend && interp_prepare(alpha);
                 if(!prepared) interp_use_current();
                 frame_head=prepared?vr_pose_blend(previous_head,simulation_head,alpha):simulation_head;
                 if(capture && check_samples>1) LOG("[vr-check] sample %u/%u alpha %.3f blended %d\n",sample+1,check_samples,alpha,prepared);
-            for(int order=0;order<2;order++) if(interp_replay_lock()) {
+            int check_eyes=frame_title_menu && getenv("ODYSSEY_VR_CHECK_TITLE_LIVE")?1:2;
+            for(int order=0;order<check_eyes;order++) if(interp_replay_lock()) {
                 int i=getenv("ODYSSEY_VR_CHECK_REVERSE")?1-order:order;
                 eye=i; g_interp_replay_epoch=epoch;
                 if(getenv("ODYSSEY_VR_CHECK_POSE")) {
@@ -475,10 +657,12 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
                 }
                 extern bool g_debug_frame;
                 g_debug_frame=capture && i==1 && getenv("ODYSSEY_VR_CHECK_PASSES");
+                uint64_t replay_at=SDL_GetTicksNS();
                 renderer_interp_replay();
+                bench_cpu+=SDL_GetTicksNS()-replay_at;
                 g_debug_frame=false;
                 if(capture) interp_replay_report();
-                if(capture) {
+                if(save_capture) {
                     char path[160];
                     if(check_samples>1) snprintf(path,sizeof path,"build/vr_rate_%llu_s%u_%c.png",(unsigned long long)renderer_present_count(),sample,i?'R':'L');
                     else if(count>1) snprintf(path,sizeof path,"build/vr_sequence_%llu_%c.png",(unsigned long long)renderer_present_count(),i?'R':'L');
@@ -488,10 +672,43 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
                 interp_replay_unlock();
             }
             }
+            if(bench_env) {
+                vk_wait_seq(vk_pending_seq()-1);
+                static uint64_t n,cpu,total;
+                if(renderer_present_count()>=bench_start) {
+                    uint64_t elapsed=SDL_GetTicksNS()-bench_at;
+                    n++;cpu+=bench_cpu;total+=elapsed;
+                    if(bench_variant>=0) {
+                        static struct { uint64_t n,cpu,total;VrFrameMetrics times; } variants[2];
+                        __typeof__(variants[0]) *s=&variants[bench_variant];
+                        s->n++;s->cpu+=bench_cpu;s->total+=elapsed;vr_metrics_observe(&s->times,elapsed);
+                        if(n%120==0 || capture)for(int mode=0;mode<2;mode++)if(variants[mode].n) {
+                            __typeof__(variants[0]) *v=&variants[mode];
+                            LOG("[vr-clear-ab] mode %d, %llu pairs: CPU %.3f ms; complete %.3f ms; p95 %.3f ms; max %.3f ms\n",
+                                mode,(unsigned long long)v->n,v->cpu/(double)v->n/1e6,v->total/(double)v->n/1e6,
+                                vr_metrics_percentile(&v->times,95),v->times.longest/1e6);
+                        }
+                    }
+                    rate_stats(false,true,false);
+                    if(n%120==0 || capture) LOG("[vr-bench] %llu pairs: translate %.3f ms/pair; complete %.3f ms/pair\n",(unsigned long long)n,cpu/(double)n/1e6,total/(double)n/1e6);
+                }
+            }
+            if(bench_variant>=0)vk_vr_load_clear_override(-1);
             completed=true;
             if(capture) {
-                LOG("[vr-check] captured sequence frame %llu\n",(unsigned long long)renderer_present_count());
-                if(renderer_present_count()>=at+count-1) { LOG("[vr-check] neutral replay capture complete\n"); fflush(stderr); exit(0); }
+                LOG("[vr-check] captured sequence frame %llu; title panel %d; first person requested %d applied %d\n",(unsigned long long)renderer_present_count(),frame_title_menu,vr_first_person_requested(),vr_first_person_applied());
+                extern uint64_t vk_vr_folded_clear_count(void);
+                LOG("[vr-clear] folded %llu image initializations\n",(unsigned long long)vk_vr_folded_clear_count());
+                if(renderer_present_count()>=at+count-1) {
+                    LOG("[vr-check] neutral replay capture complete\n"); fflush(stderr);
+#ifdef ODYSSEY_PROFILE_TRAIN
+                    // The offscreen harness exits on the render thread: flush
+                    // LLVM counters explicitly before process teardown.
+                    extern int __llvm_profile_write_file(void);
+                    LOG("[vr-bench] profile write status %d\n",__llvm_profile_write_file());
+#endif
+                    exit(0);
+                }
             }
         }
         goto done;
@@ -523,7 +740,10 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
     if(!prepared) interp_use_current();
     frame_head=prepared?vr_pose_blend(previous_head,simulation_head,alpha):simulation_head;
     XrFrameBeginInfo bi={.type=XR_TYPE_FRAME_BEGIN_INFO};
-    if(!xr_ok(pBeginFrame(session,&bi),"begin frame")) goto done;
+    vk_queue_lock();
+    XrResult begin_result=pBeginFrame(session,&bi);
+    vk_queue_unlock();
+    if(!xr_ok(begin_result,"begin frame")) goto done;
     XrCompositionLayerProjectionView projection[2];
     memset(projection,0,sizeof projection);
     bool rendered=fs.shouldRender;
@@ -557,13 +777,18 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
     }
     bool acquired[2]={false,false};
     uint64_t pair_seq=0;
-    if(rendered) for(int i=0;i<2;i++) {
+    if(rendered) for(int i=0;i<(frame_title_menu?1:2);i++) {
+        uint64_t acquire_at=SDL_GetTicksNS();
         uint32_t index;
         XrSwapchainImageAcquireInfo ai={.type=XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-        if(!xr_ok(pAcquireSwapchainImage(targets[i].swapchain,&ai,&index),"acquire eye")) { rendered=false; break; }
+        vk_queue_lock();
+        XrResult acquire_result=pAcquireSwapchainImage(targets[i].swapchain,&ai,&index);
+        vk_queue_unlock();
+        if(!xr_ok(acquire_result,"acquire eye")) { rendered=false; break; }
         XrSwapchainImageWaitInfo swi={.type=XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,.timeout=XR_INFINITE_DURATION};
         if(!xr_ok(pWaitSwapchainImage(targets[i].swapchain,&swi),"wait eye")) { rendered=false; break; }
         acquired[i]=true;
+        cost_add(C_ACQUIRE,acquire_at);
         eye=i;
         extern uint32_t g_interp_replay_epoch;
         g_interp_replay_epoch=epoch;
@@ -582,7 +807,9 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
                 LOG("[vr] rendered eye source %ux%u; OpenXR swapchain %ux%u; pacing %s\n",eye_image->width,eye_image->height,targets[i].width,targets[i].height,high_rate?"display":"game");
                 reported_size=true;
             }
+            uint64_t copy_at=SDL_GetTicksNS();
             rendered=copy_eye(eye_image,i,index);
+            cost_add(C_COPY,copy_at);
             if(rendered) pair_seq=renderer_fence_seq();
             interp_replay_unlock();
         } else rendered=false;
@@ -593,24 +820,38 @@ void vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch) {
                 .imageRect={{0,0},{(int32_t)targets[i].width,(int32_t)targets[i].height}},.imageArrayIndex=0}};
         if(!rendered) break;
     }
+    // Quad panels must be complete before handoff. Keep EarlySubmit for the
+    // gameplay projection while font/label updates in the menu retire first.
+    bool early_submit=vr_early_submit() && !frame_title_menu;
     if(pair_seq) {
-        uint64_t gpu_at=SDL_GetTicksNS();
         renderer_submit();
-        renderer_wait_seq(pair_seq);
-        cost_add(C_GPUWAIT,gpu_at);
+        if(!early_submit) vr_wait_pair(pair_seq);
     }
     for(int i=0;i<2;i++) if(acquired[i]) {
         XrSwapchainImageReleaseInfo ri={.type=XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-        if(!xr_ok(pReleaseSwapchainImage(targets[i].swapchain,&ri),"release eye")) rendered=false;
+        vk_queue_lock();
+        XrResult release_result=pReleaseSwapchainImage(targets[i].swapchain,&ri);
+        vk_queue_unlock();
+        if(!xr_ok(release_result,"release eye")) rendered=false;
     }
     XrCompositionLayerProjection layer={.type=XR_TYPE_COMPOSITION_LAYER_PROJECTION,.space=space,.viewCount=2,.views=projection};
-    const XrCompositionLayerBaseHeader *layers[]={(XrCompositionLayerBaseHeader *)&layer};
+    XrCompositionLayerQuad menu_layer={.type=XR_TYPE_COMPOSITION_LAYER_QUAD,.space=space,
+        .eyeVisibility=XR_EYE_VISIBILITY_BOTH,
+        .subImage={.swapchain=targets[0].swapchain,.imageRect={{0,0},{(int32_t)targets[0].width,(int32_t)targets[0].height}}},
+        .pose=vr_menu_panel_pose(center,2.0f),.size={2.8f,2.8f*9.0f/16.0f}};
+    const XrCompositionLayerBaseHeader *layers[]={frame_title_menu?
+        (XrCompositionLayerBaseHeader *)&menu_layer:(XrCompositionLayerBaseHeader *)&layer};
     XrFrameEndInfo ei={.type=XR_TYPE_FRAME_END_INFO,.displayTime=fs.predictedDisplayTime,
         .environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE,.layerCount=rendered?1:0,.layers=layers};
     uint64_t end_at=SDL_GetTicksNS();
-    xr_ok(pEndFrame(session,&ei),"end frame");
+    vk_queue_lock();
+    XrResult end_result=pEndFrame(session,&ei);
+    vk_queue_unlock();
+    if(!xr_ok(end_result,"end frame")) rendered=false;
     cost_add(C_END,end_at);
+    if(early_submit) vr_wait_pair(pair_seq);
     completed=rendered;
+    if(rendered) vr_metrics_record(&frame_metrics,SDL_GetTicksNS());
     if(rendered && capture_requested) { capture_requested=false; LOG("[vr] paired eye capture complete\n"); }
     rate_stats(false,rendered,prepared);
     if(++frame_count%300==0) LOG("[vr] %llu stereo frames submitted\n",(unsigned long long)frame_count);
@@ -631,6 +872,7 @@ done:
     eye_history_active=completed;
     eye=-1;
     interp_frame_rotate();
+    return false;
 }
 
 // Scale the 2D layout within the existing eye image, without moving it into a 3D plane.
@@ -642,5 +884,5 @@ float vr_ui_scale(void) {
         if(!isfinite(value) || value<.35f || value>1) value=.65f;
         LOG("[vr] UI layout scale %.0f%%\n",value*100);
     }
-    return eye>=0?value:1;
+    return eye>=0 && !frame_title_menu?value:1;
 }

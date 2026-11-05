@@ -74,6 +74,11 @@ float odyssey_wide_camera(void) {
             }
             extern void vr_apply_game_camera(float *);
             vr_apply_game_camera((float *)(uintptr_t)(cpu->x[19]+0x48));
+            extern bool vr_first_person_applied(void);
+            if(vr_first_person_applied()) {
+                nearz=fminf(nearz,5.0f);
+                memcpy(&cpu->v[0],&nearz,sizeof nearz);
+            }
             vr_game_projection(fovy,aspect,nearz,farz);
         }
     }

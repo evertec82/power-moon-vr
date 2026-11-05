@@ -147,11 +147,18 @@ bool odyssey_scene_warming(void) {
 }
 
 static void stage_scene_init(Cpu *c) {
+    extern void odyssey_vr_scene_reset(void);odyssey_vr_scene_reset();
     g_scene_new = true;
     g_init(c);
 }
 
 static void stage_scene_control(Cpu *c) {
+#ifndef __APPLE__
+    extern void vr_set_title_menu(bool);
+    vr_set_title_menu(false);
+#endif
+    extern void odyssey_vr_scene_begin(Cpu *,uint64_t);
+    odyssey_vr_scene_begin(c,c->x[0]);
     uint64_t now = renderer_present_count() + 1;
     if (g_scene_new) {
         g_scene_new = false;
@@ -187,7 +194,21 @@ static void stage_scene_control(Cpu *c) {
     g_control(c);
 }
 
+#ifndef __APPLE__
+static GuestFn title_control_original;
+static void title_scene_control(Cpu *c) {
+    extern void vr_set_title_menu(bool);
+    vr_set_title_menu(true);
+    extern void odyssey_vr_scene_reset(void);odyssey_vr_scene_reset();
+    title_control_original(c);
+}
+#endif
+
 void odyssey_boot(void) {
+#ifndef __APPLE__
+    extern void vr_set_title_menu(bool);
+    vr_set_title_menu(false);
+#endif
     const char *e = getenv("ODYSSEY_WARP");
     g_log = (e && *e) || getenv("ODYSSEY_LOG_STAGES");
     g_complete_at = getenv("ODYSSEY_SAVE_COMPLETE") ? strtoull(getenv("ODYSSEY_SAVE_COMPLETE"), NULL, 10) + 1 : 0;
@@ -218,6 +239,13 @@ void odyssey_boot(void) {
     static bool hooked;  // (always: the scene warm-up needs it too)
     if (hooked) return;
     hooked = true;
+#ifndef __APPLE__
+    uint64_t title_control=loader_find_symbol("_ZN14TitleMenuScene7controlEv");
+    if(title_control) {
+        title_control_original=dispatch_lookup(title_control);
+        hle_override(title_control,title_scene_control,"TitleMenuScene::control (stationary VR menu)");
+    }
+#endif
     uint64_t control = loader_find_symbol("_ZN10StageScene7controlEv"), init = loader_find_symbol("_ZN10StageScene4initERKN2al13SceneInitInfoE");
     if (!control || !init) {  // (a version without names: no warps, and every scene is warmed up as the title is)
         LOG("[warp] StageScene::control / init not found: no stage hooks\n");

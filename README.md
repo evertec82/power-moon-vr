@@ -1,60 +1,63 @@
 # Power Moon VR
 
-Experimental third-person OpenXR support for [Power Moon Recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp), based on v0.2.1 (`cdbe05c9df0e2ff4bfbecece89ad3f0fd9806193`). Windows x64, SteamVR/OpenXR, and a gamepad.
+OpenXR VR support for [Power Moon Recomp](https://gitlab.com/zzzarathustra-dev/power-moon-recomp), based on v0.2.1 (`cdbe05c9df0e2ff4bfbecece89ad3f0fd9806193`). Windows x64, Vulkan, SteamVR/OpenXR, and a gamepad.
 
-This repository contains the runtime and development tools. Supply your own Super Mario Odyssey 1.0.0 game files. Game dumps, keys, generated game code, compiled game libraries, saves, and caches are excluded.
+Supply your own Super Mario Odyssey 1.0.0 files. This repository and the release overlay contain no game dumps, keys, generated game code, compiled game libraries, saves, or caches.
 
-## Features
+## Download and play
 
-- Third-person stereo rendering with native camera head tracking and F10 recentering.
-- Separate eye texture histories and a serial rendering/submission path.
-- HUD and menu layout at 65% size, centered inward for easier viewing in a headset.
-- 2× rendering by default, optional 4×, and an experimental display-rate interpolation launcher.
-- F9 captures the two eye images. The FPS overlay reports VR submission and game rates.
+Download the runtime overlay from [Releases](https://github.com/evertec82/power-moon-vr/releases/latest).
 
-## Windows download
+1. Set up Power Moon Recomp v0.2.1 with your own game files and confirm desktop gameplay works. Back up the executable and saves.
+2. Remove old `Launch-VR*.cmd` scripts from that installation, then extract the overlay beside `PowerMoonRecomp.exe`, replacing the runtime. Keep your existing dependency DLLs, locally generated game library, and game data.
+3. Start SteamVR, select it as the active OpenXR runtime, and connect your headset and gamepad.
+4. Choose **`Launch-VR-2x.cmd`** (3840×2160) or **`Launch-VR-4x.cmd`** (7680×4320). Both use the same rendering and pacing settings.
 
-The [Releases](https://github.com/evertec82/power-moon-vr/releases) page provides a **runtime overlay**, not a complete game installation.
+The download is an overlay for an initialized installation, not a standalone game. A game-library build-ID mismatch requires rebuilding the library locally from your own files using this source.
 
-1. Set up Power Moon Recomp v0.2.1 using your own game files and confirm desktop gameplay works.
-2. Back up your original runtime executable, then extract the overlay into that installation beside `PowerMoonRecomp.exe`.
-3. Start SteamVR and select it as the active OpenXR runtime. Connect a gamepad.
-4. Run `Launch-VR.cmd` for the game-rate serial path, or `Launch-VR-serial-refresh.cmd` for experimental display-rate scheduling. Press **F10** to recenter.
+## Controls
 
-The overlay supplies the VR runtime and launchers; it relies on the base installation for its shared libraries and locally generated game library. If a game-library build-ID mismatch is reported, rebuild it locally from your own files using this source. Keep existing saves backed up.
+| Control | Action |
+| --- | --- |
+| Both stick clicks together (L3 + R3) | Toggle first/third person during gameplay; release before pressing again. |
+| F8 | Keyboard fallback for view switching. |
+| F10 | Recenter the headset view and stationary title panel. |
+| F9 | Capture the eye images locally. |
+| F1 | Open desktop settings. |
 
-## Build from source
+The game starts in third person. VR reserves the stick-click buttons for view switching; analog movement and camera axes remain available. No motion-controller support is included.
 
-See [Windows toolchain setup](docs/BUILD-windows.md). The bundled OpenXR headers are used at compile time; the runtime loads `openxr_loader.dll` dynamically.
+## Current behavior
 
-1. Clone this repository with LF line endings (`.gitattributes` enforces them).
-2. Run `powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1` to install the upstream Windows toolchain.
-3. From an MSYS2 UCRT64 shell in the checkout, run `make -j16` to build the runtime. Run `make dlls` to collect runtime dependencies.
-4. To generate the game library locally, place your own v1.0.0 ExeFS and RomFS in `extracted/exefs/` and `extracted/romfs/`, then run `make gen` and `make -j16`. Never upload these folders or `generated/`. Alternatively use the upstream first-run setup and its required generator/compiler tools.
-5. Copy the desired scripts from `launchers/` beside the executable in your working installation. Ensure an OpenXR loader DLL is available; SteamVR includes one, or use your installed OpenXR SDK loader.
+- Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
+- Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.
+- A fixed title panel that stays in place as you turn your head; gameplay HUD at 65% scale.
+- Fixed-60 simulation catch-up keeps game speed normal when visual FPS falls. Visual delivery can still judder below the headset refresh rate.
+- Optional first-person camera at Mario's head position, levelled against gravity, using existing head tracking. His displayed model is hidden while that view is applied and restored on return to third person.
+- Conservative shadow sharing, cached shader fingerprints, folded eligible eye clears, and nonblocking desktop mirroring reduce repeated work.
+- Unsupported HTML help/manual pages close immediately in VR instead of blocking on a desktop-only notice.
 
-The VR changes have been tested on Windows/Vulkan. Other platforms retain upstream code but VR support on them is unverified.
+Only the 2× and 4× launchers are shipped. Display interpolation and the asynchronous completion-worker experiment are disabled in both.
 
-## Settings
+## Build
 
-Edit the selected launcher to adjust:
+See [Windows toolchain setup](docs/BUILD-windows.md).
 
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `ODYSSEY_VR_UI_SCALE` | `0.65` | HUD/menu size; supported range `0.35`–`1`. `1` restores the original layout. |
-| `ODYSSEY_SCALE` | `2` | Internal resolution multiplier; 2× is 3840×2160 and 4× is 7680×4320. |
-| `ODYSSEY_VR_RATE` | `game` | `game` uses the game presentation rate; `display` enables experimental headset-rate scheduling. |
+1. Clone with LF line endings and run `powershell -ExecutionPolicy Bypass -File tools\setup_windows.ps1`.
+2. From an MSYS2 UCRT64 shell run `make -j16` for the runtime and `make dlls` for its dependencies. OpenXR headers are bundled; the loader is loaded dynamically.
+3. Generate your game library locally using the upstream first-run setup, or place your own v1.0.0 ExeFS/RomFS in `extracted/exefs/` and `extracted/romfs/`, then run `make gen` and `make -j16`. Never upload `extracted/` or `generated/`.
+4. Copy the two scripts from `launchers/` beside the executable in your installation.
 
-F1 opens desktop settings. Game logic remains at 60 Hz. Headset refresh is controlled in SteamVR/headset settings. Higher resolution and refresh increase frame time and memory requirements.
+For a portable optimized runtime, use `make B=build-release PERF_FLAGS="-O3 -ffp-contract=off -flto=thin"`. Runtime optimization flags do not change game-library generation flags or ABI. The distributed runtime additionally uses a locally trained execution profile and does not use `-march=native`. The profile and game library are excluded from downloads. VR on other platforms is unverified.
 
-## Status and limitations
+## Validation and limitations
 
-This is an experimental port, not a finished VR conversion. Gameplay HUD and pause-menu stereo captures were checked after the UI resize with zero replay draw/uniform misses. The local tester confirmed the smaller interface works. Full-game VR rendering and sustained headset-refresh performance are unverified.
+Standard and optimized Windows builds, camera math, simulation catch-up, frame metrics, shadow access ordering, shader fingerprinting, title-panel math, and the manual applet regression checks pass. Offline stereo captures were checked for ground, character, HUD, first-person occlusion and return to third person, with zero replay draw/uniform misses. The repository owner confirmed the gameplay handoff improvement and visible stationary-menu labels.
 
-Some flicker, screen-space artifacts, frame drops, and head-motion judder may remain. Display-rate interpolation is experimental; the default launcher uses game-rate presentation. There is no motion-controller support or OpenXR depth submission. First-time shader compilation can stutter.
+This remains an experimental VR port. First-person comfort, captures, cutscenes, unusual gravity and full-game coverage need further headset testing. Rendering artifacts, flicker, frame drops and shader-compilation stutter may remain; reaching headset refresh is not guaranteed. There is no OpenXR depth submission.
 
-The additional asynchronous completion/threading experiment was rolled back after head-motion regressions and is not included.
+One reported Vulkan device-loss crash occurred while the game waited in an unsupported HTML help applet. The blocking VR path has been removed and tested; the exact GPU-loss cause was not proven and longer-session stability is unverified.
 
 ## Credits and license
 
-Runtime source: [MIT](LICENSE), retaining the upstream Power Moon Recomp / LAS Recomp notices. VR changes were developed with Codex and tested by the repository owner. Third-party notices remain under `third_party/`; see [THIRD_PARTY.md](THIRD_PARTY.md). This project is unaffiliated with Nintendo, Valve, or the upstream project. Super Mario Odyssey belongs to its respective owners.
+Runtime source: [MIT](LICENSE), retaining the upstream Power Moon Recomp / LAS Recomp notices. VR changes were developed with Codex and tested by the repository owner. See [THIRD_PARTY.md](THIRD_PARTY.md). This project is unaffiliated with Nintendo, Valve, or the upstream project. Super Mario Odyssey belongs to its respective owners.

@@ -161,6 +161,16 @@ void input_handle_event(const SDL_Event *e) {
     }
     switch (e->type) {
     case SDL_EVENT_KEY_DOWN: case SDL_EVENT_KEY_UP:
+#ifndef __APPLE__
+        {
+            extern bool vr_enabled(void),menu_input_captured(void);
+            extern void vr_toggle_first_person(void);
+            if(e->key.scancode==SDL_SCANCODE_F8 && vr_enabled()) {
+                if(e->type==SDL_EVENT_KEY_DOWN && !e->key.repeat && !menu_input_captured())vr_toggle_first_person();
+                break;
+            }
+        }
+#endif
         if (e->type == SDL_EVENT_KEY_DOWN && e->key.scancode == SDL_SCANCODE_F9 && !e->key.repeat) g_debug_frame_request = 1;
         if (e->key.scancode < SDL_SCANCODE_COUNT) keys_down[e->key.scancode] = e->type == SDL_EVENT_KEY_DOWN;
         recompute_keyboard();
@@ -338,6 +348,10 @@ void input_frame(uint64_t frame) {
     extern void watch_arm(void);
     watch_arm();
     host_test_frame(frame);
+#ifndef __APPLE__
+    extern void vr_poll_view_buttons(uint64_t);
+    vr_poll_view_buttons(key_buttons|pad_buttons|script_buttons);
+#endif
     const char *spec = getenv("ODYSSEY_INPUT");
     if (!spec) return;
     static const char *const names[] = {"A", "B", "X", "Y", "LSTICK", "RSTICK", "L", "R", "ZL", "ZR", "PLUS",
@@ -375,7 +389,13 @@ void input_frame(uint64_t frame) {
 extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or name entry up (it has the keys / pad)
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
-uint64_t input_buttons_now(void) { return (menu_input_captured() ? 0 : key_buttons | pad_buttons) | script_buttons; }
+uint64_t input_buttons_now(void) {
+    uint64_t b=(menu_input_captured()?0:key_buttons|pad_buttons)|script_buttons;
+#ifndef __APPLE__
+    extern uint64_t vr_filter_view_buttons(uint64_t);b=vr_filter_view_buttons(b);
+#endif
+    return b;
+}
 
 static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 
@@ -408,6 +428,9 @@ static void fill_state(Cpu *c) {
     }
     int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
     int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+#ifndef __APPLE__
+    extern uint64_t vr_filter_view_buttons(uint64_t);b=vr_filter_view_buttons(b);
+#endif
     // stick directions also appear as buttons (bits 16-23)
     if (lx < -16000) b |= 1ull << 16;
     if (ly > 16000) b |= 1ull << 17;

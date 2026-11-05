@@ -758,7 +758,7 @@ static bool copy_to_twin(NvnTexture *t) {
 typedef struct VrImages {
     NvnTexture *original, *eye[2], *start[2];
     uint32_t generation[2], epoch[2], history_generation[2];
-    uint32_t start_epoch[2],start_generation[2];
+    uint32_t start_epoch[2],start_generation[2],clear_generation[2];
     struct VrImages *next;
 } VrImages;
 static VrImages *vr_images[1024];
@@ -802,6 +802,28 @@ static void vr_sample_begin(void) {
         if(repeat) image_copy_all(tex_backend(base),tex_backend(v->eye[eye]));
     }
 }
+// A full-image, single-subresource attachment can be zeroed by its first
+// rendering load operation instead of a standalone transfer clear plus barriers.
+static bool vr_load_clear_scope;
+static uint64_t vr_folded_clears;
+uint64_t vk_vr_folded_clear_count(void) { return vr_folded_clears; }
+static int vr_load_clear_override=-1;
+void vk_vr_load_clear_scope(bool eligible) { vr_load_clear_scope=eligible; }
+void vk_vr_load_clear_override(int value) { vr_load_clear_override=value; }
+bool vk_vr_load_clear_enabled(void) {
+    static int enabled=-1;
+    if(enabled<0) { const char *e=getenv("ODYSSEY_VR_LOAD_CLEAR"); enabled=e && atoi(e)!=0; }
+    return vr_load_clear_override>=0?vr_load_clear_override:enabled;
+}
+bool vk_vr_take_load_clear(NvnTexture *t) {
+    int eye=vr_eye_index();
+    if(eye<0 || !t)return false;
+    VrImages *v=*vr_image_slot(t);
+    if(!v || v->clear_generation[eye]!=twin_gen)return false;
+    v->clear_generation[eye]=0;
+    vr_folded_clears++;
+    return true;
+}
 static NvnTexture *vr_redirect(NvnTexture *t, bool write, int eye) {
     VrImages **slot = vr_image_slot(t), *v = *slot;
     if (v && v->generation[eye] == twin_gen) return v->eye[eye];
@@ -829,6 +851,8 @@ static NvnTexture *vr_redirect(NvnTexture *t, bool write, int eye) {
     TexBackend *src = tex_backend(seed), *dst = tex_backend(v->eye[eye]);
     dst->gpu_owned = true;
     if (!t->carry && tex_scalable(t)) {
+        if(vr_load_clear_scope && vk_vr_load_clear_enabled()) v->clear_generation[eye]=twin_gen;
+        else {
         vk_end_pass();
         VkCommandBuffer cb=vk_cmd();
         vk_full_barrier(cb);
@@ -841,6 +865,7 @@ static NvnTexture *vr_redirect(NvnTexture *t, bool write, int eye) {
             vkCmdClearDepthStencilImage(cb,dst->image,VK_IMAGE_LAYOUT_GENERAL,&z,1,&range);
         }
         vk_full_barrier(cb);
+        }
     } else image_copy_all(src, dst);
     v->generation[eye] = twin_gen;
     v->epoch[eye] = replay_epoch;
@@ -860,6 +885,7 @@ static void vr_images_forget(NvnTexture *t) {
 }
 // (a logged frame's lists, render lock) t read or about to be written
 static void frame_access(NvnTexture *t, bool write) {
+    vr_shadow_access(&t->vr_access,g_tex_epoch,write);
     if (!write) {
         if (t->wr_epoch != g_tex_epoch) t->rd_epoch = g_tex_epoch;
         return;
@@ -869,9 +895,35 @@ static void frame_access(NvnTexture *t, bool write) {
     if (t->rd_epoch == g_tex_epoch) t->carry = true;
     if (t->carry && copy_to_twin(t)) t->snap_epoch = g_tex_epoch;
 }
+// Only current-frame, non-temporal depth maps with one write phase are shared.
+// The native pass already rendered these under exactly the same game camera.
+static int vr_shadow_override=-1;
+void vk_vr_shadow_override(int on) { vr_shadow_override=on; }
+bool vk_vr_share_shadow(NvnTexture *t) {
+    static int on=-1;
+    if(on<0) { const char *e=getenv("ODYSSEY_VR_SHARE_SHADOWS"); on=e?atoi(e):0; }
+    extern bool vr_multiple_samples(void);
+    extern bool vr_shadow_share_allowed(void);
+    int level=vr_shadow_override>=0?vr_shadow_override:on;
+    if(!level || !t || t->target!=1 || t->samples>1 || t->width!=t->height || t->width<128 ||
+       !renderer_format_is_depth(t->format) || vr_eye_index()<0 || !vr_shadow_share_allowed()) return false;
+    return level>=2?vr_shadow_single_phase(&t->vr_access,replay_epoch):
+        !t->carry && vr_shadow_complete(&t->vr_access,replay_epoch);
+}
+bool vk_vr_skip_shadow_write(NvnTexture *t) {
+    if(!vk_vr_share_shadow(t))return false;
+    t->vr_shadow_write_gen=twin_gen;
+    return true;
+}
 static NvnTexture *replay_redirect(NvnTexture *t, bool for_render) {
     int eye = vr_eye_index();
-    if (eye >= 0) return vr_redirect(t, for_render, eye);
+    if (eye >= 0) {
+        if(vk_vr_share_shadow(t)) {
+            if(for_render)t->vr_shadow_write_gen=twin_gen;
+            else return t->vr_shadow_write_gen!=twin_gen && t->twin && t->snap_epoch==replay_epoch?t->twin:t;
+        }
+        return vr_redirect(t, for_render, eye);
+    }
     if (!t->carry) return t;
     bool start = t->twin && t->snap_epoch == replay_epoch;
     if (!for_render) return start || (t->twin && t->twin_gen == twin_gen) ? t->twin : t;

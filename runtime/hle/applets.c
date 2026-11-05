@@ -30,7 +30,14 @@ HLE_FUNC("_ZN2nn3web19ShowOfflineHtmlPageEPNS0_26OfflineHtmlPageReturnValueERKNS
     }
     LOG("[applet] web: offline HTML page %s requested (lr %llx) - not available, the player is told\n",
         page[0] ? page : "(?)", (unsigned long long)c->x[30]);
-    menu_notice_run("Not available on PC",
+    bool vr=false;
+#ifndef __APPLE__
+    extern bool vr_enabled(void);vr=vr_enabled();
+#endif
+    // A synchronous desktop-only notice stops VR frame servicing. Treat this
+    // unsupported applet as closed immediately in VR, as the return value says.
+    if(vr) LOG("[applet] unsupported manual closed immediately in VR\n");
+    else menu_notice_run("Not available on PC",
                     "This is a page of the game's built-in manual (like the Action Guide). On the Switch the console's "
                     "web browser shows it, from a part of the game that isn't in the files you dumped (exefs and romfs) "
                     "- so Power Moon Recomp can't show it.");

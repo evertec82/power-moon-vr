@@ -523,7 +523,7 @@ static struct { bool on; VkImageView view; VkExtent2D ext; } comp;
 
 // Acquire the next window image and begin rendering into it (cleared to `clear`). Returns false when there is
 // nothing to draw into (minimised window).
-bool vk_frame_begin(const float clear[4]) {
+static bool frame_begin_mode(const float clear[4],bool nonblocking) {
     present_lock();  // (until vk_frame_end)
     cur_frame.ok = false;
     int w, h;
@@ -537,14 +537,17 @@ bool vk_frame_begin(const float clear[4]) {
     static int trace = -1;
     if (trace < 0) trace = getenv("ODYSSEY_VK_TRACE") != NULL;
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
-    slot = (slot + 1) % FRAMES;
+    int next_slot = (slot + 1) % FRAMES;
+    if(nonblocking && slot_seq[next_slot]>vk_completed_seq()) { present_unlock(); return false; }
+    slot=next_slot;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
     vk_wait_seq(slot_seq[slot]);
-    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, nonblocking?0:UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
     }
+    if(nonblocking && (r==VK_NOT_READY || r==VK_TIMEOUT)) { present_unlock(); return false; }
     if (r != VK_SUCCESS && r != VK_SUBOPTIMAL_KHR) {  // (out of date again: the window is being resized / restored)
         static uint64_t nfail;
         if (nfail++ % 600 == 0) LOG("[vk] acquire failed: %d (%llu times)\n", r, (unsigned long long)nfail);
@@ -569,6 +572,8 @@ bool vk_frame_begin(const float clear[4]) {
     cur_frame.ok = true;
     return true;
 }
+
+bool vk_frame_begin(const float clear[4]) { return frame_begin_mode(clear,false); }
 
 // Passes of their own between vk_frame_begin and vk_frame_end (exec.c post passes): end the window image's
 // rendering, and begin it again keeping what was drawn.
@@ -1185,7 +1190,7 @@ static void frame_decide(NvnTexture *t, uint64_t present_at) {
     fd.game_w = fd.game_img = NULL;
     if (vr && closed) {
         extern uint32_t g_tex_epoch;
-        vr_frame(closed, t, g_tex_epoch);
+        fd.skip |= vr_frame(closed, t, g_tex_epoch, present_at);
         closed = NULL;
     }
     // With in-betweens the game's image is composed for the window now (the replay draws the in-between into b) and the
@@ -1294,7 +1299,11 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
     if (menu_at && (long)total_frames + 1 == menu_at) { extern void menu_test_open(void); menu_test_open(); }
     bool have = false;
     if (!fd.game_w && !fd.skip && fd.placed) {
-        have = vk_frame_begin(black);
+        // The desktop mirror must not wait for a monitor image while OpenXR
+        // owns the presentation cadence. Leave it unchanged when it is busy.
+        static int mirror_try=-1;
+        if(mirror_try<0) { const char *e=getenv("ODYSSEY_VR_MIRROR_NONBLOCKING"); mirror_try=!e || atoi(e)!=0; }
+        have = frame_begin_mode(black,vr_enabled() && mirror_try);
         uint64_t nd = SDL_GetTicksNS() - t0;
         if (nd > 30000000) {
             static int warned;

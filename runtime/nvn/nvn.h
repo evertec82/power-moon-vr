@@ -1,3 +1,5 @@
+#include "shader_fingerprint.h"
+#include "vulkan/vr_shadow.h"
 // NVN implemented on the host. Guest NVN objects hold a pointer to a host object at offset 0;
 // builders and small state objects store their fields directly in guest memory.
 #pragma once
@@ -43,6 +45,8 @@ typedef struct NvnTexture {
     struct NvnTexture *twin;  // (vulkan/textures.c: what frame interpolation's replays draw instead of this one)
     uint32_t twin_gen;
     uint32_t rd_epoch, wr_epoch, snap_epoch;  // (textures.c: read / first written in a game frame; its frame-start copy)
+    uint32_t vr_shadow_write_gen; // first logical shadow write in the current eye replay
+    VrShadowAccess vr_access; // native write/read ordering used by optional serial VR shadow sharing
     bool carry;  // (textures.c) a frame read it before writing it: what replays draw into it must not reach the game
     bool window;  // one of the window's textures (nvnWindowInitialize): what is drawn into it is dithered (exec.c draw_;
                   // past addr: not part of the description, so its other initializations still find it)
@@ -78,6 +82,8 @@ typedef struct NvnShaderStage {
     uint32_t stage;           // NVNshaderStage
     uint64_t code_addr;       // GPU (== CPU) address of the code
     const uint8_t *control;   // control section
+    uint64_t fingerprint;
+    bool fingerprint_valid;
     uint32_t const_offset, const_size;  // compiler constants (bound as c1), within the code blob
     void *backend;
 } NvnShaderStage;

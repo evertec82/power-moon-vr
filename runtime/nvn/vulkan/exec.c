@@ -1020,6 +1020,7 @@ static void st_defaults(void) {
 
 void vk_exec_init(void) {
     prof = getenv("ODYSSEY_VK_PROF") != NULL;
+    if(getenv("ODYSSEY_VR_BENCH_START")) LOG("[vr-bench] detailed profiling %s\n",prof?"on":"off");
     if (prof) {
         prof_up_ns = 0;
         VkQueryPoolCreateInfo qi = {.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO, .queryType = VK_QUERY_TYPE_TIMESTAMP, .queryCount = SUBS * 2};
@@ -1376,6 +1377,27 @@ static void vk_end_pass_at(int line) {
 
 static uint32_t level_extent(uint32_t v, uint32_t lv) { v >>= lv; return v ? v : 1; }
 
+// Load-op clears cover only the render area. Require identical full-sized,
+// single-level 2D attachments so folding the eye initialization clears every
+// texel that the original transfer clear would have initialized.
+static bool vr_clear_scope_eligible(void) {
+    extern int vr_eye_index(void);
+    if(vr_eye_index()<0)return false;
+    uint32_t w=0,h=0;
+    for(int i=0;i<=st.rt.ncolor;i++) {
+        NvnTexture *t=i<st.rt.ncolor?st.rt.color[i]:st.rt.depth;
+        if(!t)continue;
+        TexBackend *b=t->backend;
+        bool has=i<st.rt.ncolor?st.rt.has_cview[i]:st.rt.has_dview;
+        const NvnTextureView *v=i<st.rt.ncolor?&st.rt.cview[i]:&st.rt.dview;
+        if(t->target!=1 || !b || b->levels!=1 || b->layers!=1 || b->depth!=1 || b->samples!=1)return false;
+        if(has && (((v->setmask&1) && (v->base_level || v->num_levels>1)) ||
+                   ((v->setmask&2) && (v->min_layer || v->num_layers>1))))return false;
+        if(w && (w!=b->width || h!=b->height))return false;
+        w=b->width;h=b->height;
+    }
+    return w && h;
+}
 static void begin_pass(void) {
     if (in_pass && !st.rt_dirty) return;
     vk_end_pass();
@@ -1393,6 +1415,8 @@ static void begin_pass(void) {
         gp_mark(cb, "pass: %d color %ux%u fmt %#x, depth %s", st.rt.ncolor, t0 ? t0->width : 0, t0 ? t0->height : 0,
                 t0 ? t0->format : 0, st.rt.depth ? "yes" : "no");
     }
+    bool fold_clear=vk_vr_load_clear_enabled() && vr_clear_scope_eligible();
+    vk_vr_load_clear_scope(fold_clear);
     VkRenderingAttachmentInfo ca[8], da = {0}, sa = {0};
     uint32_t w = 0, minw = UINT32_MAX, minh = UINT32_MAX;  // w: first attachment seen
     pass_ncolor = (uint32_t)st.rt.ncolor;
@@ -1424,6 +1448,10 @@ static void begin_pass(void) {
             ca[i].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
             ca[i].clearValue.color.float32[3] = fresh ? 0.0f : 1.0f;
         }
+        if(fold_clear && vk_vr_take_load_clear(t) && ca[i].loadOp!=VK_ATTACHMENT_LOAD_OP_CLEAR) {
+            ca[i].loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;
+            memset(&ca[i].clearValue,0,sizeof ca[i].clearValue);
+        }
         pass_color[i] = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 4) && vk_format(t->format) == b->format
                       ? vk_format(st.rt.cview[i].format) : b->format;
         uint32_t lv = st.rt.has_cview[i] && (st.rt.cview[i].setmask & 1) ? st.rt.cview[i].base_level : 0;
@@ -1443,6 +1471,10 @@ static void begin_pass(void) {
             VkRenderingAttachmentInfo a = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = v,
                                            .imageLayout = VK_IMAGE_LAYOUT_GENERAL, .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
                                            .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+            if(fold_clear && vk_vr_take_load_clear(st.rt.depth)) {
+                a.loadOp=VK_ATTACHMENT_LOAD_OP_CLEAR;
+                a.clearValue.depthStencil=(VkClearDepthStencilValue){1,0};
+            }
             if (b->aspect & VK_IMAGE_ASPECT_DEPTH_BIT) { da = a; has_d = true; pass_depth = b->format; }
             if (b->aspect & VK_IMAGE_ASPECT_STENCIL_BIT) { sa = a; has_s = true; pass_stencil = b->format; }
             uint32_t lv = st.rt.has_dview && (st.rt.dview.setmask & 1) ? st.rt.dview.base_level : 0;
@@ -1453,6 +1485,7 @@ static void begin_pass(void) {
             if (!pass_ncolor) pass_samples = b->samples;
         }
     }
+    vk_vr_load_clear_scope(false);
     if (!w) { pass_sx = pass_sy = 1; minw = minh = 16; }
     {   // (output resolution) every attachment of a pass needs the same scale: one at another scale clips the render area
         // to the smaller one - the scene in a corner of the image (output_scale_texture misses a target)
@@ -1642,6 +1675,7 @@ static VkPipeline clear_pipeline(int index, int kind, uint32_t mask, bool depth,
 
 static void clear(int index, int kind, const void *color, uint32_t mask, bool depth, float dval, bool stencil, uint32_t sval,
                   uint32_t smask) {
+    if(index<0 && !st.rt.ncolor && vk_vr_skip_shadow_write(st.rt.depth)) return;
     begin_pass();
     VkCommandBuffer cb = vk_cmd();
     vp_sx = pass_sx; vp_sy = pass_sy; vp_ox = 0; vp_oy = 0;
@@ -1698,7 +1732,7 @@ typedef struct {
     VkBindingInfo binds[MAX_BIND];
     int nbinds;
     VkDescriptorSetLayout set_layout[2];
-    VkPipelineLayout layout;
+    VkPipelineLayout layout,lib_layout[2];
     bool vs_uses_vid;
     VkPipeline lib_pr[2], lib_fs;  // (g_vk.gpl) the compiled shaders as pipeline libraries: vertex (line / fill), fragment
     bool no_gpl;                   // libraries failed: whole pipelines
@@ -1726,10 +1760,22 @@ static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, V
     // graphics: the vertex attribute kinds (GLSL contract in shader.h), the same range in every layout so the values
     // stay across pipeline binds
     VkPushConstantRange pc = {VK_SHADER_STAGE_VERTEX_BIT, 0, 80};
-    VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = (uint32_t)nsets,
+    // GPL shader libraries are shared independently across programs. Their
+    // unused descriptor sets can differ, so Vulkan requires independent sets.
+    VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                                     .flags = g_vk.gpl && nsets>1 ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0,
+                                     .setLayoutCount = (uint32_t)nsets,
                                      .pSetLayouts = p->set_layout, .pushConstantRangeCount = nsets > 1, .pPushConstantRanges = &pc};
     VkPipelineLayout l;
     VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &l));
+    if(g_vk.gpl && nsets==2)for(int stage=0;stage<2;stage++) {
+        // A shared library declares only its own stage's descriptor set.
+        // Independent sets alone do not permit conflicting non-null layouts.
+        VkDescriptorSetLayout sets[2]={VK_NULL_HANDLE,VK_NULL_HANDLE};
+        sets[stage]=p->set_layout[stage];
+        ci.pSetLayouts=sets;
+        VK_CHECK(vkCreatePipelineLayout(g_vk.dev,&ci,NULL,&p->lib_layout[stage]));
+    }
     return l;
 }
 
@@ -2660,7 +2706,7 @@ static void slib_key(const Prog *p, bool frag, bool fill, uint64_t k[3]);
 static void pbin_path(char *out, size_t n, const Prog *p, bool frag, bool fill) {
     uint64_t k[3];
     slib_key(p, frag, fill, k);
-    snprintf(out, n, "cache/pbin/%016llx.bin", (unsigned long long)hash_words(0x9e3779b97f4a7c15ull ^ 2, k, sizeof k));
+    snprintf(out, n, "cache/pbin/%016llx.bin", (unsigned long long)hash_words(0x9e3779b97f4a7c15ull ^ 3, k, sizeof k));
 }
 
 // The library from its data (VK_NULL_HANDLE: none, or the driver refused it). pi: the create info as for a compile,
@@ -2802,7 +2848,7 @@ static VkPipeline shader_lib_make(Prog *p, bool frag, bool fill, bool cached_onl
     VkPipelineDepthStencilStateCreateInfo ds = {.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
     VkPipelineDynamicStateCreateInfo dpr = DYN_INFO(DYN_PR), dfs = DYN_INFO(DYN_FS);
     VkGraphicsPipelineCreateInfo pi = {.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, .pNext = &ri, .stageCount = 1,
-                                       .pStages = &stage, .layout = p->layout};
+                                       .pStages = &stage, .layout = p->lib_layout[frag?1:0] ? p->lib_layout[frag?1:0] : p->layout};
     // (input assembly: ignored by the spec in a pre-rasterization library, but NVIDIA's driver reads it there in some
     // cases - left NULL, a new player's first library compile crashed it reading NULL + 0x18, 2026-11-04)
     VkPipelineInputAssemblyStateCreateInfo ia = {.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
@@ -3041,6 +3087,7 @@ static void *pm_worker(void *arg) {
                     VkPipeline libs[2] = {shader_lib(p, false, true, false), shader_lib(p, true, true, false)};
                     for (int k = 0; k < 2; k++) if (libs[k]) vkDestroyPipeline(g_vk.dev, libs[k], NULL);
                     vkDestroyPipelineLayout(g_vk.dev, p->layout, NULL);
+                    for(int k=0;k<2;k++)if(p->lib_layout[k])vkDestroyPipelineLayout(g_vk.dev,p->lib_layout[k],NULL);
                     for (int k = 0; k < 2; k++) if (p->set_layout[k]) vkDestroyDescriptorSetLayout(g_vk.dev, p->set_layout[k], NULL);
                 }
                 if (p->vs) vkDestroyShaderModule(g_vk.dev, p->vs, NULL);
@@ -4512,7 +4559,11 @@ static void draw_(CmdRec *r, bool indexed) {
     {   // fragment-shader hash: skip lists (debug)
         static uint64_t last_fs, last_hash;
         uint64_t fs = st.program->stages[1].code_addr;
-        if (fs != last_fs) {
+        static int cache_hash=-1;
+        if(cache_hash<0) { const char *e=getenv("ODYSSEY_VR_SHADER_HASH_CACHE"); cache_hash=!e || atoi(e)!=0; }
+        if(cache_hash && st.program->stages[1].fingerprint_valid) {
+            last_fs=fs; last_hash=st.program->stages[1].fingerprint;
+        } else if (fs != last_fs) {
             last_fs = fs;
             last_hash = fs ? hmix(1469598103934665603ull, (const void *)(uintptr_t)(fs + 0x30), 0x200) : 0;
         }
@@ -4558,6 +4609,12 @@ static void draw_(CmdRec *r, bool indexed) {
         // camera block that rule took for a light's: snapped with a light while the colour pass blended, the pass's
         // depth-equal test failed - a parasol near the camera black in the in-betweens)
         if (!interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
+    }
+    // The draw record was consumed above, so skipping its GPU work preserves replay ordering.
+    if(g_interp_replaying && !st.rt.ncolor && vk_vr_share_shadow(st.rt.depth)) {
+        static uint64_t shared; shared++;
+        if(shared%10000==1 && getenv("ODYSSEY_VR_BENCH_START")) LOG("[vr-shadow] shared %llu shadow draws\n",(unsigned long long)shared);
+        return;
     }
     // Consume the replay draw before filtering it, so subsequent uniform records stay aligned.
     extern bool vr_filter_effects(void);
