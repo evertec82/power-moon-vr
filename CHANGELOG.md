@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.3
+
+- Anchor gameplay HUD layouts and text to the character-camera panel instead of the headset. Preserve neutral size, project clipping bounds with the panel, and use the scene pose for compositor reprojection. Headset validation pending.
+
+- Route game vibration to left/right OpenXR haptic actions alongside gamepad rumble.
+- Expire stale side amplitudes, bound pulse durations, protect gamepad disconnects and stop vibration on reset/settings changes.
+- Add Controls → Test vibration. Host routing, OpenXR output and controller-input regression checks pass; physical strength/compatibility testing is pending.
+
 ## v0.2.2
 
 - **Native camera blur disabled by default in VR:** use the game's own blur-system control to address light smearing during fast horizontal head and stick turns. Bloom, fog, lighting and lens flares are restored; the previous broad fog/glow workaround is disabled in the launchers.

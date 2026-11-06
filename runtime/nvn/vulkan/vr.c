@@ -18,6 +18,7 @@
 #include "vr_camera_math.h"
 #include "vr_camera_state.h"
 #include "vr_menu.h"
+#include "vr_hud.h"
 #include "vr_first_person.h"
 #include "../../cpu.h"
 #include "../renderer.h"
@@ -520,12 +521,8 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
     // Match game's depth convention (including reverse Z) so its depth tests remain valid.
     q[10]=p[10]; q[14]=p[14];
     if(!world) {
-        // HUD/menu plane 2 metres in front of the original view, maintaining its 16:9 aspect.
-        float z=2*scale;
-        vr_identity(p); p[0]=z*.70f; p[5]=z*.39375f; p[10]=0; p[14]=-z;
-        vr_pose_inverse(v,pose.orientation.x,pose.orientation.y,pose.orientation.z,pose.orientation.w,
-                        pose.position.x*scale,pose.position.y*scale,pose.position.z*scale);
-        vr_multiply(tmp,v,p); vr_multiply(out,q,tmp);
+        XrPosef delta=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[eye].pose),true,late_geometry_test());
+        vr_hud_matrix(out,pose_compose(frame_head,delta),frame_fov,vr_ui_scale());
         return;
     }
     if(!vr_inverse(inv,p)) return;
@@ -947,7 +944,8 @@ done:
     return false;
 }
 
-// Scale the 2D layout within the existing eye image, without moving it into a 3D plane.
+bool vr_hud_camera_fixed(void) {return eye>=0 && !frame_title_menu;}
+// Angular size at the neutral pose; the HUD panel transform applies this once.
 float vr_ui_scale(void) {
     static float value=-1;
     if(value<0) {

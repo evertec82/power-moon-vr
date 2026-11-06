@@ -6,6 +6,7 @@
 #include <SDL3/SDL.h>
 #include <ctype.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../vibration.h"
 #include "../nvn/vulkan/vr_input_state.h"
 
 enum {
@@ -28,6 +30,12 @@ static _Atomic uint64_t key_buttons, pad_buttons;
 static _Atomic int32_t key_lx, key_ly, key_rx, key_ry, pad_lx, pad_ly, pad_rx, pad_ry;
 static uint8_t keys_down[SDL_SCANCODE_COUNT];
 static SDL_Gamepad *pad;
+// Protect the rumble producer against UI-thread gamepad disconnect/reconnect.
+static pthread_mutex_t vibration_lock=PTHREAD_MUTEX_INITIALIZER;
+static VibrationMixer game_vibration;
+static uint16_t rumble_low,rumble_high;
+static uint64_t rumble_at;
+static SDL_JoystickID rumble_pad;
 static _Atomic int64_t sampling;
 
 // Host keys / buttons held by a test script (ODYSSEY_HOST_INPUT, input_frame): they go through the bindings
@@ -166,7 +174,7 @@ void input_handle_event(const SDL_Event *e) {
         scanned = true;
         int n = 0;
         SDL_JoystickID *ids = SDL_GetGamepads(&n);
-        if (n > 0 && !pad) { pad = SDL_OpenGamepad(ids[0]); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (n > 0 && !pad) { pthread_mutex_lock(&vibration_lock);pad = SDL_OpenGamepad(ids[0]);pthread_mutex_unlock(&vibration_lock); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
         SDL_free(ids);
     }
     switch (e->type) {
@@ -186,10 +194,10 @@ void input_handle_event(const SDL_Event *e) {
         recompute_keyboard();
         break;
     case SDL_EVENT_GAMEPAD_ADDED:
-        if (!pad) { pad = SDL_OpenGamepad(e->gdevice.which); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
+        if (!pad) { pthread_mutex_lock(&vibration_lock);pad = SDL_OpenGamepad(e->gdevice.which);pthread_mutex_unlock(&vibration_lock); LOG("[input] gamepad: %s\n", SDL_GetGamepadName(pad)); note_family(); }
         break;
     case SDL_EVENT_GAMEPAD_REMOVED:
-        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { SDL_CloseGamepad(pad); pad = NULL; note_family(); }
+        if (pad && SDL_GetGamepadID(pad) == e->gdevice.which) { pthread_mutex_lock(&vibration_lock);SDL_CloseGamepad(pad);pad=NULL;rumble_pad=0;pthread_mutex_unlock(&vibration_lock);note_family(); }
         recompute_pad();
         break;
     case SDL_EVENT_GAMEPAD_AXIS_MOTION: case SDL_EVENT_GAMEPAD_BUTTON_DOWN: case SDL_EVENT_GAMEPAD_BUTTON_UP:
@@ -534,27 +542,52 @@ HLE_FUNC("_ZN2nn3hid27BindNpadStyleSetUpdateEventERKjPNS_2os15SystemEventTypeENS
 // stronger side per band (low band: the low-frequency motor). Sent again while it lasts, so a value runs 250 ms at most:
 // a game that stops sending stops the rumble. Controls tab "Vibration" (`vibration` in powermoon.ini).
 void input_vibration(uint32_t handle, float amp_low, float amp_high) {
-    static float lo[2], hi[2];
-    static uint16_t last_l, last_h;
-    static uint64_t last_ns;
     static int log = -1;  // ODYSSEY_LOG_RUMBLE=1: each change sent to the gamepad
-    if (log < 0) log = getenv("ODYSSEY_LOG_RUMBLE") != NULL;
     int side = handle & 1;
-    lo[side] = isfinite(amp_low) ? amp_low : 0, hi[side] = isfinite(amp_high) ? amp_high : 0;
-    float l = fmaxf(lo[0], lo[1]), h = fmaxf(hi[0], hi[1]);
-    if (!g_settings.rumble) l = h = 0;
-    // (the Joy-Cons' actuators are strong: the game's amplitudes are mostly 0.02-0.2, which a gamepad's motors barely
-    // turn at - small ones get a boost, (a + a^0.4) / 2: 0.04 -> 0.2, 0.17 -> 0.37, 1 -> 1; below 0.015, nothing)
-    l = l < 0.015f ? 0 : (fminf(l, 1) + powf(fminf(l, 1), 0.4f)) * 0.5f;
-    h = h < 0.015f ? 0 : (fminf(h, 1) + powf(fminf(h, 1), 0.4f)) * 0.5f;
-    uint16_t L = (uint16_t)(l * 65535.0f), H = (uint16_t)(h * 65535.0f);
-    uint64_t now = plat_now_ns();
-    if (L == last_l && H == last_h && (!(L | H) || now - last_ns < 100000000ull)) return;  // (the same: again every 100 ms)
-    last_l = L, last_h = H, last_ns = now;
+    uint64_t now=SDL_GetTicksNS();
+#ifndef __APPLE__
+    // Publish each side before gamepad aggregate throttling: equal motor totals
+    // can still mean the effect moved from one VR controller to the other.
+    vr_input_vibration(side,g_settings.rumble?amp_low:0,g_settings.rumble?amp_high:0);
+#endif
+    pthread_mutex_lock(&vibration_lock);
+    if (log < 0) log = getenv("ODYSSEY_LOG_RUMBLE") != NULL;
+    vibration_publish(&game_vibration,side,amp_low,amp_high,now);
+    VibrationOutput next=vibration_output(&game_vibration,now,g_settings.rumble);
+    uint16_t L=(uint16_t)(next.low*65535),H=(uint16_t)(next.high*65535);
+    SDL_JoystickID id=pad?SDL_GetGamepadID(pad):0;
+    if(id==rumble_pad && L==rumble_low && H==rumble_high && (!(L|H)||(now>=rumble_at&&now-rumble_at<100000000ull))) {
+        pthread_mutex_unlock(&vibration_lock);return;
+    }
+    rumble_pad=id;rumble_low=L;rumble_high=H;rumble_at=now;
     if (log) LOG("[input] rumble %.2f %.2f\n", L / 65535.0, H / 65535.0);
-    SDL_Gamepad *p = pad;
-    if (p) SDL_RumbleGamepad(p, L, H, (L | H) ? 250 : 0);
+    if(pad) {
+        uint64_t remaining=0;
+        for(int i=0;i<2;i++)if(next.hand[i]>0 && next.remaining[i]>remaining)remaining=next.remaining[i];
+        uint32_t ms=(uint32_t)((remaining+999999)/1000000);
+        bool sent=SDL_RumbleGamepad(pad,L,H,(L|H)?ms:0);
+        static SDL_JoystickID reported;
+        if((L|H)&&reported!=id) {
+            reported=id;LOG("[input] gamepad rumble %s%s\n",sent?"active":"unavailable: ",sent?"":SDL_GetError());
+        }
+    }
+    pthread_mutex_unlock(&vibration_lock);
 }
+
+void input_stop_vibration(void) {
+    pthread_mutex_lock(&vibration_lock);
+    memset(&game_vibration,0,sizeof game_vibration);rumble_low=rumble_high=0;rumble_at=0;rumble_pad=0;
+    if(pad)SDL_RumbleGamepad(pad,0,0,0);
+    pthread_mutex_unlock(&vibration_lock);
+#ifndef __APPLE__
+    vr_input_stop_vibration();
+#endif
+}
+void input_test_vibration(void) {
+    if(!g_settings.rumble)return;
+    input_vibration(0,.22f,0);input_vibration(1,0,.22f);
+}
+RT_ON_RESET(input_vibration_reset) {input_stop_vibration();}
 
 HLE_FUNC("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", hid_init_vibration) { (void)c; }
 HLE_FUNC("_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", hid_vibration_handles) {
@@ -568,5 +601,5 @@ HLE_FUNC("_ZN2nn3hid22GetVibrationDeviceInfoEPNS0_19VibrationDeviceInfoERKNS0_21
     uint32_t *info = (uint32_t *)(uintptr_t)c->x[0];
     uint32_t h = *(uint32_t *)(uintptr_t)c->x[1];
     info[0] = 1;        // VibrationDeviceType_LinearResonantActuator
-    info[1] = h & 1;    // position: left / right
+    info[1] = (h & 1) + 1; // position enum: None=0, Left=1, Right=2
 }

@@ -32,6 +32,8 @@ extern "C" {
 #include "menu.h"
 #include "setup.h"
 void input_reset(void);
+void input_stop_vibration(void);
+void input_test_vibration(void);
 void controls_bindings_draw(float scale);  // controls_ui.mm
 #include "../input_bind.h"
 #include "../paths.h"
@@ -629,8 +631,9 @@ static void tab_about(void) {
     hint("The game's text language, as its own system setting. Applies the next time the game starts.");
     ImGui::Spacing();
     header("Controller");
-    toggle("Vibration", &g_settings.rumble);
-    hint("The controller's rumble, as the game sends it (the Switch's HD rumble on the controller's motors).");
+    if(toggle("Vibration", &g_settings.rumble) && !g_settings.rumble)input_stop_vibration();
+    hint("Game vibration on the gamepad motors and the left/right VR controllers. Requires supported hardware.");
+    if(opt_button("Test vibration", "A brief pulse on the connected gamepad and VR controllers. Enable Vibration first."))input_test_vibration();
     {
         static const int pct[] = {0, 5, 10, 15, 20, 25, 30};
         static const char *const names[] = {"Off", "5%", "10%", "15%", "20%", "25%", "30%"};

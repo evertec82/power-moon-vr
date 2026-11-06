@@ -34,7 +34,7 @@ SERVICE("hid", hid) {
     case 101: OUT(uint32_t, 0) = 0x1F; resp_size(resp, 4); break;  // GetSupportedNpadStyleSet
     case 121: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadJoyHoldType
     case 129: OUT(int64_t, 0) = 0; resp_size(resp, 8); break;      // GetNpadHandheldActivationMode
-    // vibration (the SDK's nn::hid::SendVibrationValue(s): the game's HD rumble) onto the gamepad (hle/input.c)
+    // Game HD rumble goes to gamepad motors and VR haptic actions (hle/input.c).
     case 201:  // SendVibrationValue: handle, VibrationValue (low amplitude, low frequency, high amplitude, high frequency)
         input_vibration(IN(uint32_t, 0), IN(float, 4), IN(float, 12));
         break;
@@ -47,7 +47,8 @@ SERVICE("hid", hid) {
         break;
     }
     case 202: case 203: case 207: case 208: case 209: break;
-    case 200: memset(resp->data, 0, 0x10); OUT(uint32_t, 0) = 1; resp_size(resp, 0x10); break;
+    case 200: // GetVibrationDeviceInfo: actuator type and Left=1 / Right=2 position.
+        OUT(uint32_t, 0) = 1; OUT(uint32_t, 4) = (IN(uint32_t, 0) & 1) + 1; resp_size(resp, 8); break;
     default: break;  // Activate*/Set*: accept
     }
 }

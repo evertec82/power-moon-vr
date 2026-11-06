@@ -34,6 +34,7 @@ bool vr_fps(float *submitted,float *target);
 void vr_eye_replay_begin(void);
 
 float vr_ui_scale(void);
+bool vr_hud_camera_fixed(void);
 
 // Frontend scene state; captured with each queued game frame.
 void vr_set_title_menu(bool active);

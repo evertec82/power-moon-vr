@@ -25,7 +25,7 @@ The package contains the base app and setup tools, but no game content. A game-l
 | F9 | Capture the eye images locally. |
 | F1 | Open desktop settings. |
 
-The game starts in third person. VR reserves the stick-click buttons for view switching; analog movement and camera axes remain available. VR-controller buttons and sticks are supported alongside the gamepad; tracked hands, swing gestures and VR haptics are not included.
+The game starts in third person. VR reserves the stick-click buttons for view switching; analog movement and camera axes remain available. VR-controller buttons and sticks are supported alongside the gamepad; tracked hands and swing gestures are not included.
 
 ## VR controller defaults
 
@@ -42,11 +42,15 @@ The game starts in third person. VR reserves the stick-click buttons for view sw
 
 Touch-style controllers, Index, Microsoft motion controllers and simple-controller fallback have suggested bindings. Index uses A/B on each hand; Microsoft motion controllers use trackpad click for primary and right menu for secondary. SteamVR can rebind actions. Buttons combine with gamepad input; the stronger stick vector wins. VR input clears on focus loss or stale data.
 
+The gameplay HUD is anchored to the character camera: head turns and leaning let you look around the panel, while the game camera carries it with the character view. Neutral HUD size is preserved. Headset validation is pending.
+
+Game vibration drives the gamepad motors and the corresponding left/right VR controllers. **Controls → Vibration** controls both; **Test vibration** sends a short pulse to connected devices. Switch HD-rumble amplitudes are approximated on ordinary motors/OpenXR pulses, with bounded duration and stale-input expiry. Physical controller testing of VR haptics is pending.
+
 ## Current behavior
 
 - Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
 - Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.
-- A fixed title panel that stays in place as you turn your head; gameplay HUD at 65% scale.
+- A fixed title panel and a character-camera-anchored gameplay HUD at 65% neutral scale.
 - Fixed-60 simulation catch-up keeps game speed normal when visual FPS falls. Visual delivery can still judder below the headset refresh rate.
 - Optional first-person camera at Mario's head position, levelled against gravity, using existing head tracking. His displayed model is hidden while that view is applied and restored on return to third person.
 - Conservative shadow sharing, cached shader fingerprints, folded eligible eye clears, and nonblocking desktop mirroring reduce repeated work.

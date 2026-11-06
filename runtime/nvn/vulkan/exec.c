@@ -1553,8 +1553,31 @@ static VkRect2D scissor_rect(void) {
     return (VkRect2D){{x, y}, {(uint32_t)sw, (uint32_t)sh}};
 }
 
-static void apply_scissor(float ui_scale) {
+static void apply_scissor(float ui_scale,const float *hud_matrix) {
     VkRect2D r = scissor_rect();
+    if(hud_matrix && r.extent.width && r.extent.height) {
+        // The layout's clipping rectangle must follow its panel, too. A
+        // conservative projected bound avoids clipping HUD text on head turns.
+        float x0=pass_w,y0=pass_h,x1=0,y1=0;
+        bool behind=false;
+        for(int i=0;i<4;i++) {
+            float x=2*(((float)r.offset.x+(i&1?r.extent.width:0))-ss.vp.x)/ss.vp.width-1;
+            float y=2*(((float)r.offset.y+(i&2?r.extent.height:0))-ss.vp.y)/ss.vp.height-1;
+            float w=hud_matrix[3]*x+hud_matrix[7]*y+hud_matrix[15];
+            if(w<=.001f){behind=true;break;}
+            float px=(hud_matrix[0]*x+hud_matrix[4]*y+hud_matrix[12])/w;
+            float py=(hud_matrix[1]*x+hud_matrix[5]*y+hud_matrix[13])/w;
+            px=ss.vp.x+(px+1)*ss.vp.width*.5f;
+            py=ss.vp.y+(py+1)*ss.vp.height*.5f;
+            x0=fminf(x0,px);x1=fmaxf(x1,px);y0=fminf(y0,py);y1=fmaxf(y1,py);
+        }
+        if(behind)r=(VkRect2D){{0,0},{pass_w,pass_h}};
+        else {
+            int a=(int)floorf(fmaxf(0,fminf(pass_w,x0))),b=(int)floorf(fmaxf(0,fminf(pass_h,y0)));
+            int c=(int)ceilf(fmaxf(0,fminf(pass_w,x1))),d=(int)ceilf(fmaxf(0,fminf(pass_h,y1)));
+            r=(VkRect2D){{a,b},{c>a?c-a:0,d>b?d-b:0}};
+        }
+    }
     if(ui_scale<1 && r.extent.width && r.extent.height) {
         float cx=pass_w*.5f,cy=pass_h*.5f;
         int x0=(int)floorf(cx+(r.offset.x-cx)*ui_scale),y0=(int)floorf(cy+(r.offset.y-cy)*ui_scale);
@@ -4518,6 +4541,8 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
 
 static void draw_(CmdRec *r, bool indexed) {
     float ui_scale=1;
+    bool hud_panel=false;
+    float hud_matrix[16];
     if (prof) prof_tp_ = SDL_GetTicksNS();
     g_draw_relaxed = false;
     if (!st.program) { stat_skipped++; return; }
@@ -4730,7 +4755,7 @@ static void draw_(CmdRec *r, bool indexed) {
         memcpy(ss.ak, akind, sizeof akind);
         vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof akind, akind);
     }
-    // Eye transforms affect scene geometry; HUD, fullscreen processing and shadow maps retain their original space.
+    // Scene geometry and actual HUD layouts have separate camera transforms.
     {
         extern void vr_clip_matrix(float out[16], bool world, bool flip_y, bool depth_minus_one,
                                    const void *uniforms, uint64_t bytes);
@@ -4764,11 +4789,15 @@ static void draw_(CmdRec *r, bool indexed) {
         if((kind==VR_PASS_HUD || layout_text) && ui_target && ui_target->width>=640 && ui_target->height>=360 &&
            ui_target->width>1.70f*ui_target->height && ui_target->width<1.82f*ui_target->height &&
            st.viewport[0][2]>=ui_target->width*.9f && st.viewport[0][3]>=ui_target->height*.9f) {
-            extern float vr_ui_scale(void); ui_scale=vr_ui_scale();
+            extern float vr_ui_scale(void);
+            extern bool vr_hud_camera_fixed(void);
+            hud_panel=vr_hud_camera_fixed();
+            if(!hud_panel)ui_scale=vr_ui_scale();
         }
-        if (kind == VR_PASS_WORLD)
+        if (kind == VR_PASS_WORLD || hud_panel)
             vr_clip_matrix(eye_matrix, kind == VR_PASS_WORLD, vkey.flip_y, vkey.depth_minus_one,
                            (const void *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size);
+        if(hud_panel)memcpy(hud_matrix,eye_matrix,sizeof hud_matrix);
         }
         vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 16, sizeof eye_matrix, eye_matrix);
     }
@@ -4920,7 +4949,7 @@ static void draw_(CmdRec *r, bool indexed) {
                 vp_sx, vp_sy);
         }
     }
-    apply_scissor(ui_scale);
+    apply_scissor(ui_scale,hud_panel?hud_matrix:NULL);
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     if(ui_scale<1) {
         rs0[0]*=ui_scale; rs0[1]*=ui_scale;

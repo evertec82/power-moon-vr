@@ -4,6 +4,9 @@
 #include <math.h>
 #include <string.h>
 #include <stdlib.h>
+// Game vibration threads publish here; only the render owner calls OpenXR.
+void vr_input_vibration(int side,float low,float high);
+void vr_input_stop_vibration(void);
 typedef struct {uint64_t buttons;int32_t lx,ly,rx,ry;uint64_t stamp;} VrControllerState;
 typedef struct {bool primary[2],secondary[2],menu[2],click[2];float trigger[2],grip[2],stick[2][2];} VrControllerRaw;
 static void vr_controller_stick(float x,float y,int32_t *ox,int32_t *oy){
