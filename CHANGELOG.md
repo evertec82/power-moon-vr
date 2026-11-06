@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.2
+
+- **Native camera blur disabled by default in VR:** use the game's own blur-system control to address light smearing during fast horizontal head and stick turns. Bloom, fog, lighting and lens flares are restored; the previous broad fog/glow workaround is disabled in the launchers.
+- **Resolution presets:** 2x, 3x, 4x and 5x (9600x5400). The 5x launcher replaces 6x.
+- **Complete Windows runtime:** retains the base DLLs, VR-controller/gamepad support and first-run setup/compiler tools from v0.2.1. No separate base download is required.
+
+The owner reported promising initial results with camera blur disabled. Extended headset testing remains pending; this is an incremental experimental update, not a guarantee that all rendering artifacts are fixed. Heap-boundary/register-preservation checks pass, and a Sand Kingdom stereo replay completed with zero draw/uniform misses. Head-tracking and render scheduling are unchanged from v0.2.1.
+
 ## v0.2.1
 
 Power Moon VR v0.2.1 includes a complete Windows runtime package and the latest controller/lighting test updates.

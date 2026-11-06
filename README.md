@@ -11,7 +11,7 @@ Download the Windows runtime package from [Releases](https://github.com/evertec8
 1. Extract the complete runtime ZIP into a new folder. It includes SDL3, the LGPL FFmpeg DLLs, other runtime dependencies, Roboto, and the first-run generator/compiler tools. A separate base app installation is unnecessary.
 2. Supply your own Super Mario Odyssey v1.0.0 ExeFS/RomFS using the setup screen. When updating, back up your installation and retain your own `extracted/` and `save/` folders; replace the app files and remove obsolete launchers.
 3. Start SteamVR, select it as the active OpenXR runtime, and connect your headset and gamepad.
-4. Choose **`Launch-VR-2x.cmd`** (3840×2160), **`Launch-VR-3x.bat`** (5760×3240), **`Launch-VR-4x.cmd`** (7680×4320), or **`Launch-VR-6x.bat`** (11520×6480). All use the same controller, rendering and pacing settings.
+4. Choose **`Launch-VR-2x.cmd`** (3840×2160), **`Launch-VR-3x.bat`** (5760×3240), **`Launch-VR-4x.cmd`** (7680×4320), or **`Launch-VR-5x.bat`** (9600×5400). All use the same controller, rendering and pacing settings.
 
 The package contains the base app and setup tools, but no game content. A game-library build-ID mismatch requires rebuilding the library locally from your own files. Windows 10/11 x64 and a Vulkan-capable GPU driver are required; system/driver DLLs are not redistributed.
 
@@ -52,9 +52,9 @@ Touch-style controllers, Index, Microsoft motion controllers and simple-controll
 - Conservative shadow sharing, cached shader fingerprints, folded eligible eye clears, and nonblocking desktop mirroring reduce repeated work.
 - Unsupported HTML help/manual pages close immediately in VR instead of blocking on a desktop-only notice.
 - Frame-owned replay commands remove a live command-handle lifetime hazard, and optional native camera-time queries reduce pose age while preserving consistent geometry/lighting poses.
-- The launchers enable the known fog/glow compatibility filter for moving cloud-light artifacts; some fog/bloom may be reduced. Set `ODYSSEY_VR_EFFECTS=full` to compare. Physical confirmation of this workaround is pending.
+- Native camera blur is disabled by default in VR. The game triggers this effect from horizontal camera-angle changes, which produced distracting light smearing during fast head or stick turns. This uses the game's system control and preserves bloom, fog, lighting and lens flares. Set `ODYSSEY_VR_CAMERA_BLUR=on` to compare; the shipped launchers explicitly select `off`. The owner reported initial improvement; extended testing is pending.
 
-2×, 3×, 4× and 6× launchers are shipped. Display interpolation, repeated-image scheduling and the asynchronous completion-worker experiment are disabled.
+2×, 3×, 4× and 5× launchers are shipped. Display interpolation, repeated-image scheduling and the asynchronous completion-worker experiment are disabled.
 
 ## Build
 
@@ -71,7 +71,7 @@ For a portable optimized runtime, use `make B=build-release PERF_FLAGS="-O3 -ffp
 
 Standard and optimized Windows builds, camera math, simulation catch-up, frame metrics, shadow access ordering, shader fingerprinting, title-panel math, and the manual applet regression checks pass. Offline stereo captures were checked for ground, character, HUD, first-person occlusion and return to third person, with zero replay draw/uniform misses. The repository owner confirmed the gameplay handoff improvement and visible stationary-menu labels.
 
-This remains an experimental VR port. First-person comfort, captures, cutscenes, unusual gravity and full-game coverage need further headset testing. Rendering artifacts, flicker, frame drops and shader-compilation stutter may remain; reaching headset refresh is not guaranteed. There is no OpenXR depth submission. The controller mapping/merge checks and SteamVR binding attachment pass, but physical controller validation is pending. The 3×/6× presets are unverified in a headset.
+This remains an experimental VR port. First-person comfort, captures, cutscenes, unusual gravity and full-game coverage need further headset testing. Rendering artifacts, flicker, frame drops and shader-compilation stutter may remain; reaching headset refresh is not guaranteed. There is no OpenXR depth submission. The controller mapping/merge checks and SteamVR binding attachment pass, but physical controller validation is pending. The 3×/5× presets are unverified in a headset.
 
 One reported Vulkan device-loss crash occurred while the game waited in an unsupported HTML help applet. The blocking VR path has been removed and tested; the exact GPU-loss cause was not proven and longer-session stability is unverified.
 

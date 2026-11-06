@@ -45,6 +45,8 @@ static Cpu scratch(Cpu *c) {Cpu q=*c;q.sp=(q.sp-0x800)&~UINT64_C(15);return q;}
 void odyssey_vr_scene_reset(void) {atomic_store(&vr_scene,0);hidden_actor=hidden_keeper=0;vr_first_person_frame_begin();}
 void odyssey_vr_scene_begin(Cpu *c,uint64_t scene) {
     if(!vr_enabled())return;
+    extern void odyssey_vr_disable_camera_blur(Cpu *,uint64_t);
+    odyssey_vr_disable_camera_blur(c,scene);
     bind_queries();atomic_store(&vr_scene,scene);
     if(hidden_actor) {
         Cpu q=scratch(c);uint64_t p=model(&q,scene);
