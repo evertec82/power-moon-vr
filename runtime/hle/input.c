@@ -15,6 +15,7 @@
 #include "../nvn/renderer.h"
 #include "../settings.h"
 #include "../input_bind.h"
+#include "../nvn/vulkan/vr_input_state.h"
 
 enum {
     BTN_A = 0, BTN_B, BTN_X, BTN_Y, BTN_LSTICK, BTN_RSTICK, BTN_L, BTN_R, BTN_ZL, BTN_ZR, BTN_PLUS, BTN_MINUS,
@@ -34,6 +35,15 @@ static uint8_t test_keys[SDL_SCANCODE_COUNT];
 static _Atomic uint32_t test_pad;
 static _Atomic int32_t test_lx, test_ly;  // (a resting stick's drift: "lstick" in ODYSSEY_HOST_INPUT)
 static bool host_test;  // (then a real controller is left out: the player's own pad must not spoil the test)
+
+static VrControllerState vr_controls_now(void){
+ VrControllerState s={0};
+#ifndef __APPLE__
+ static int blocked=-1;if(blocked<0){const char *e=getenv("ODYSSEY_NO_USER_INPUT");blocked=e?atoi(e)!=0:(getenv("ODYSSEY_INPUT")||getenv("ODYSSEY_DOORJUMP_TEST")||getenv("ODYSSEY_PLACE")||getenv("ODYSSEY_HOST_INPUT")||getenv("ODYSSEY_BIND_TEST"));}
+ if(!blocked&&!host_test)vr_input_read(&s);
+#endif
+ return s;
+}
 
 static int held_key(int sc) { return sc > 0 && sc < SDL_SCANCODE_COUNT && (keys_down[sc] || test_keys[sc]); }
 
@@ -350,7 +360,9 @@ void input_frame(uint64_t frame) {
     host_test_frame(frame);
 #ifndef __APPLE__
     extern void vr_poll_view_buttons(uint64_t);
-    vr_poll_view_buttons(key_buttons|pad_buttons|script_buttons);
+    extern bool menu_input_captured(void);
+    VrControllerState vr=vr_controls_now();
+    vr_poll_view_buttons(menu_input_captured()?0:key_buttons|pad_buttons|script_buttons|vr.buttons);
 #endif
     const char *spec = getenv("ODYSSEY_INPUT");
     if (!spec) return;
@@ -390,7 +402,8 @@ extern bool menu_input_captured(void);  // runtime/ui/menu.mm: overlay menu or n
 
 // Buttons held right now (keyboard, gamepad, test script), independent of whether the game polls (movies).
 uint64_t input_buttons_now(void) {
-    uint64_t b=(menu_input_captured()?0:key_buttons|pad_buttons)|script_buttons;
+    VrControllerState vr=vr_controls_now();
+    uint64_t b=(menu_input_captured()?0:key_buttons|pad_buttons|vr.buttons)|script_buttons;
 #ifndef __APPLE__
     extern uint64_t vr_filter_view_buttons(uint64_t);b=vr_filter_view_buttons(b);
 #endif
@@ -419,15 +432,18 @@ static void fill_state(Cpu *c) {
         LOG("[input] watching controller object %llx\n", c->x[1] - 8);
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons;
+    VrControllerState vr=vr_controls_now();
+    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons | vr.buttons;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;
         if (g_inject_plus > 0) { until = renderer_present_count() + 10; g_inject_plus = 0; }
         if (renderer_present_count() < until) b |= 1ull << BTN_PLUS;
     }
-    int32_t lx = clamp_axis((menu ? 0 : key_lx + pad_lx) + script_lx), ly = clamp_axis((menu ? 0 : key_ly + pad_ly) + script_ly);
-    int32_t rx = clamp_axis((menu ? 0 : key_rx + pad_rx) + script_rx), ry = clamp_axis((menu ? 0 : key_ry + pad_ry) + script_ry);
+    int32_t lx=clamp_axis(key_lx+pad_lx),ly=clamp_axis(key_ly+pad_ly),rx=clamp_axis(key_rx+pad_rx),ry=clamp_axis(key_ry+pad_ry);
+    vr_merge_stick(&lx,&ly,vr.lx,vr.ly);vr_merge_stick(&rx,&ry,vr.rx,vr.ry);
+    lx=clamp_axis((menu?0:lx)+script_lx);ly=clamp_axis((menu?0:ly)+script_ly);
+    rx=clamp_axis((menu?0:rx)+script_rx);ry=clamp_axis((menu?0:ry)+script_ry);
 #ifndef __APPLE__
     extern uint64_t vr_filter_view_buttons(uint64_t);b=vr_filter_view_buttons(b);
 #endif

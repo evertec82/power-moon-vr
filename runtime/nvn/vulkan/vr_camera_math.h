@@ -108,3 +108,16 @@ static bool vr_head_changed(XrPosef a,XrPosef b) {
     float dx=a.position.x-b.position.x,dy=a.position.y-b.position.y,dz=a.position.z-b.position.z;
     return dot<.99999848f || dx*dx+dy*dy+dz*dz>0.000004f;
 }
+
+// Derive both projection and submission from the same predicted head. Camera
+// uniforms retain their recorded pose; every world pass receives one shared delta.
+static XrPosef vr_replay_eye_delta(XrPosef recorded,XrPosef predicted,XrPosef predicted_eye,bool world,bool late) {
+    XrPosef local=pose_relative(predicted,predicted_eye);
+    local.orientation=(XrQuaternionf){0,0,0,1};
+    if(!late||!world)return local;
+    return pose_relative(recorded,pose_compose(predicted,local));
+}
+
+static XrPosef vr_replay_eye_pose(XrPosef origin,XrPosef recorded,XrPosef predicted,XrPosef predicted_eye,bool late) {
+    return pose_compose(origin,pose_compose(recorded,vr_replay_eye_delta(recorded,predicted,predicted_eye,true,late)));
+}

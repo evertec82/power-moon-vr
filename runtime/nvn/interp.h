@@ -64,3 +64,7 @@ void interp_replay_report(void);
 void interp_frame_rotate(void);           // (interpolation thread) after a frame: it becomes the previous one
 void interp_log_stats(void);  // (interpolation thread, per game frame) a line every ODYSSEY_INTERP_LOG seconds (default 2)
 
+
+// Immutable native execution stream; control-flow commands are flattened by executor.
+void interp_command_record(const void *record,size_t size);
+const void *interp_commands(size_t *size);

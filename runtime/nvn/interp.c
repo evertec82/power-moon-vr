@@ -42,6 +42,7 @@
 #include "../platform.h"
 #include "../settings.h"
 #include "interp.h"
+#include "command_snapshot.h"
 
 bool g_interp_log, g_interp_replaying;
 uint64_t g_interp_present_frame;
@@ -90,6 +91,7 @@ typedef struct {
     CbRec *cbs; uint32_t ncbs, cap_cbs;
     uint8_t *bytes; uint64_t nbytes, cap_bytes;
     uint64_t *handles; uint32_t nhandles, cap_handles;
+    CommandSnapshot commands;  // flattened commands actually executed, owned by this frame
     bool overflow, destroyed;
     uint64_t free_gen;  // interp_free_begin's count when the frame's first list ran
     uint64_t frame_no;  // the game's present it was closed at (interp_frame_close)
@@ -491,6 +493,7 @@ static float cls_get(const Frame *f, const CbRec *c) {
 static void frame_reset(Frame *f) {
     f->ndraws = f->ncbs = f->nhandles = f->nsto = f->ndout = 0;
     f->nbytes = 0;
+    f->commands.size = 0;
     f->overflow = f->destroyed = false;
 }
 
@@ -535,6 +538,17 @@ bool interp_list_submitted(uint64_t handle) {
     GROW(lg->handles, lg->nhandles, lg->cap_handles, 64);
     lg->handles[lg->nhandles++] = handle;
     return first;
+}
+
+// Capture during native execution, after CALL/JUMP resolution. Replays never
+// resolve a guest command handle that the next game frame may already replace.
+void interp_command_record(const void *record,size_t size) {
+    if(!g_interp_log||g_interp_replaying||!frame_open||!lg||lg->overflow)return;
+    if(!command_snapshot_append(&lg->commands,record,size))lg->overflow=true;
+}
+const void *interp_commands(size_t *size) {
+    *size=cur&&!cur->overflow?cur->commands.size:0;
+    return *size?cur->commands.data:NULL;
 }
 
 // (the backend, at the frame's first list) its executor state: a replay of the frame starts from it

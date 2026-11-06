@@ -10,6 +10,8 @@
 #include <string.h>
 #include <stdatomic.h>
 #include "vr_pacing.h"
+#include "vr_prediction.h"
+#include "vr_input.h"
 #include "vr_simulation.h"
 #include "vr_frame_metrics.h"
 #include "vr_math.h"
@@ -39,7 +41,7 @@ static XrInstance instance;
 static XrSystemId system_id;
 static XrSession session;
 static XrSpace space;
-static bool enabled, booted, running, failed;
+static bool enabled, booted, running, failed,focused;
 static bool offscreen_check;
 static int eye = -1;
 static XrView views[2];
@@ -56,6 +58,11 @@ static VrRateClock refresh_clock;
 static _Atomic int64_t display_period_ns;
 static _Atomic float measured_vr_fps,target_vr_hz;
 static bool multiple_samples,previous_camera_valid;
+static _Atomic bool pose_queries_active;
+static _Atomic int64_t camera_lead_ns;
+static _Atomic uint64_t native_query_ns,native_query_n;
+static int64_t pose_prediction_time,applied_pose_time,frame_pose_time;
+static uint64_t pose_prediction_host;
 static _Atomic bool title_menu_active;
 static bool frame_title_menu;
 void vr_set_title_menu(bool active) {
@@ -105,6 +112,24 @@ static bool rate_requested(void) {
     }
     return requested;
 }
+static bool serial_high_rate(void) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("ODYSSEY_VR_SERIAL_RATE");on=e&&atoi(e)!=0;}
+    return on;
+}
+// Geometry-only late rotation leaves screen-space reconstruction in the old
+// camera. Default to the recorded image pose; the compositor warps all layers
+// of that completed image together. Retain the old variant only for diagnostics.
+static bool native_pose_query_enabled(void) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("ODYSSEY_VR_NATIVE_POSE_QUERY");on=e&&atoi(e)!=0;}
+    return on;
+}
+static bool late_geometry_test(void) {
+    static int on=-1;
+    if(on<0){const char *e=getenv("ODYSSEY_VR_LATE_GEOMETRY_TEST");on=e&&atoi(e)!=0;}
+    return serial_high_rate()&&on;
+}
 bool vr_simulation_enabled(void) {
     static int on=-1;
     if(on<0) { const char *e=getenv("ODYSSEY_VR_SIMULATION"); on=e && atoi(e)!=0; }
@@ -115,7 +140,7 @@ uint64_t vr_simulation_deadline(uint64_t now) {
     return vr_simulation_step(&clock,now);
 }
 bool vr_multiple_samples(void) { return multiple_samples; }
-bool vr_shadow_share_allowed(void) { return !multiple_samples && !rate_requested(); }
+bool vr_shadow_share_allowed(void) { return serial_high_rate() || (!multiple_samples && !rate_requested()); }
 bool vr_high_rate_pacing(void) {
     int64_t period=atomic_load(&display_period_ns);
     return vr_enabled() && !vr_simulation_enabled() && rate_requested() && running && period>0;
@@ -131,6 +156,8 @@ static void cost_add(int kind,uint64_t start) { cost_ns[kind]+=SDL_GetTicksNS()-
 static double cost_ms(int kind) { return cost_n[kind]?(double)cost_ns[kind]/cost_n[kind]/1e6:0; }
 static bool previous_head_motion;
 static uint64_t motion_frames;
+static int64_t last_predicted;
+static uint64_t prediction_sum,prediction_n,extra_images;
 static void rate_stats(bool game,bool rendered,bool blended) {
     static uint64_t since,games,images,interpolated;
     uint64_t now=SDL_GetTicksNS();
@@ -142,6 +169,12 @@ static void rate_stats(bool game,bool rendered,bool blended) {
         LOG("[vr-rate] VR %.1f fps / %.1f Hz target; game %.1f fps; %llu interpolated images; %llu head-motion frames\n",
             images/seconds,(double)atomic_load(&target_vr_hz),games/seconds,(unsigned long long)interpolated,(unsigned long long)motion_frames);
         LOG("[vr-cost] match %.2f ms/game, prepare %.2f ms/image, xrWait %.2f ms/image, replay %.2f ms/eye, gpuWait %.2f ms/image, xrEnd %.2f ms/image\n",cost_ms(C_MATCH),cost_ms(C_PREP),cost_ms(C_XRWAIT),cost_ms(C_REPLAY),cost_ms(C_GPUWAIT),cost_ms(C_END));
+        if(serial_high_rate()&&prediction_n) {
+            LOG("[vr-rate-test] predicted cadence %.3f ms; %llu additional images from existing simulation frames\n",prediction_sum/(double)prediction_n/1e6,(unsigned long long)extra_images);
+            prediction_sum=prediction_n=extra_images=0;
+        }
+        uint64_t query_n=atomic_exchange(&native_query_n,0),query_ns=atomic_exchange(&native_query_ns,0);
+        if(query_n)LOG("[vr-pose] native camera query %.3f ms/call; adaptive lead %.2f ms; %llu queries\n",query_ns/(double)query_n/1e6,atomic_load(&camera_lead_ns)/1e6,(unsigned long long)query_n);
         if(cost_n[C_ACQUIRE]) LOG("[vr-transfer] acquire %.2f ms/eye, copy submit %.2f ms/eye\n",cost_ms(C_ACQUIRE),cost_ms(C_COPY));
         if(frame_metrics.count) {
             LOG("[vr-pacing] delivery p50 %.2f p95 %.2f p99 %.2f ms; longest %.2f ms; %u intervals\n",
@@ -161,7 +194,8 @@ static void rate_stats(bool game,bool rendered,bool blended) {
 static bool vr_early_submit(void) {
     static int enabled=-1;
     if(enabled<0) { const char *e=getenv("ODYSSEY_VR_EARLY_SUBMIT"); enabled=e && atoi(e)!=0;
-        LOG("[vr] gameplay compositor handoff %s; menu panels wait for GPU completion; serial GPU retirement\n",enabled?"before GPU wait":"after GPU wait"); }
+        LOG("[vr] gameplay compositor handoff %s; menu panels wait for GPU completion; serial GPU retirement\n",enabled?"before GPU wait":"after GPU wait");
+        if(serial_high_rate())LOG("[vr-rate-test] serial display cadence, recorded image pose, compositor head correction; no animation interpolation\n"); }
     return enabled;
 }
 static void vr_wait_pair(uint64_t seq) {
@@ -183,6 +217,26 @@ static XrPosef applied_head={.orientation={0,0,0,1}};
 static XrPosef frame_head={.orientation={0,0,0,1}};
 static XrPosef tracking_head={.orientation={0,0,0,1}};
 typedef struct { float *key,base[21],last[21]; bool used; } CameraBase;
+static bool query_native_head(XrPosef *head,int64_t *pose_time) {
+    if(!native_pose_query_enabled()||offscreen_check||!atomic_load(&pose_queries_active))return false;
+    uint64_t now=SDL_GetTicksNS();int64_t target;XrPosef anchor;
+    pthread_mutex_lock(&camera_lock);
+    bool valid=centered&&vr_prediction_target(pose_prediction_time,pose_prediction_host,now,atomic_load(&camera_lead_ns),&target);
+    anchor=center;
+    pthread_mutex_unlock(&camera_lock);
+    if(!valid)return false;
+    XrView v[2]={{.type=XR_TYPE_VIEW},{.type=XR_TYPE_VIEW}};uint32_t n=0;
+    XrViewState state={.type=XR_TYPE_VIEW_STATE};
+    XrViewLocateInfo li={.type=XR_TYPE_VIEW_LOCATE_INFO,.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,.displayTime=target,.space=space};
+    XrResult r=pLocateViews(session,&li,&state,2,&n,v);
+    atomic_fetch_add(&native_query_ns,SDL_GetTicksNS()-now);atomic_fetch_add(&native_query_n,1);
+    if(XR_FAILED(r)||n!=2||!(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)||!(state.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT))return false;
+    *head=pose_relative(anchor,v[0].pose);XrPosef right=pose_relative(anchor,v[1].pose);
+    head->position.x=(head->position.x+right.position.x)*.5f;
+    head->position.y=(head->position.y+right.position.y)*.5f;
+    head->position.z=(head->position.z+right.position.z)*.5f;
+    *pose_time=target;return true;
+}
 static CameraBase camera_base[16];
 static unsigned camera_next;
 void vr_apply_game_camera(float *fields) {
@@ -198,6 +252,7 @@ void vr_apply_game_camera(float *fields) {
     if(entry && entry->used && !memcmp(base+12,entry->last+12,9*sizeof(float))) memcpy(base,entry->base,sizeof base);
     XrPosef h=native_head;
     pthread_mutex_unlock(&camera_lock);
+    int64_t queried_time=0;query_native_head(&h,&queried_time);
     float original_base[21];memcpy(original_base,base,sizeof base);
     bool fp=false;
     if(vr_first_person_requested()) {
@@ -217,7 +272,7 @@ void vr_apply_game_camera(float *fields) {
     if(was_fp!=fp)LOG("[vr-view] %s camera applied\n",fp?"first-person":"third-person");
     memcpy(fields,out,sizeof out);
     pthread_mutex_lock(&camera_lock);
-    applied_head=h;
+    applied_head=h;applied_pose_time=queried_time;
     if(entry) { memcpy(entry->base,original_base,sizeof original_base); memcpy(entry->last,fields,sizeof base); entry->used=true; }
     pthread_mutex_unlock(&camera_lock);
     static bool logged;
@@ -255,6 +310,7 @@ void vr_camera_snapshot(VrCameraState *out) {
     out->title_menu=atomic_load_explicit(&title_menu_active,memory_order_relaxed);
     out->fovy=game_camera.fovy; out->aspect=game_camera.aspect;
     out->nearz=game_camera.nearz; out->farz=game_camera.farz;
+    out->pose_time=applied_pose_time;
     memcpy(out->orientation,&applied_head.orientation,sizeof out->orientation);
     memcpy(out->position,&applied_head.position,sizeof out->position);
     pthread_mutex_unlock(&camera_lock);
@@ -268,6 +324,7 @@ static void freeze_projection(void) {
     if(rq_on_thread() && have_queued_camera) state=queued_camera;
     else vr_camera_snapshot(&state);
     frame_title_menu=state.title_menu;
+    frame_pose_time=state.pose_time;
     pthread_mutex_lock(&camera_lock);
     bool valid=state.valid;
     float fy=valid?state.fovy:wanted_fovy;
@@ -348,6 +405,7 @@ void vr_bootstrap(void) {
     LOG("[vr] runtime %s, world scale %.2f units/m; F10 recenters\n",props.runtimeName,scale);
     LOG("[vr] separate eye history enabled; fog/glow compatibility filter available\n");
     enabled=true;
+    vr_input_init(instance,getproc);
 }
 
 static void append_extensions(bool device,const char **ext,uint32_t *n,uint32_t capacity) {
@@ -382,6 +440,7 @@ void vr_session_init(void) {
         .physicalDevice=g_vk.phys,.device=g_vk.dev,.queueFamilyIndex=g_vk.qfam,.queueIndex=0};
     XrSessionCreateInfo ci={.type=XR_TYPE_SESSION_CREATE_INFO,.next=&binding,.systemId=system_id};
     XR_TRY(pCreateSession(instance,&ci,&session));
+    vr_input_attach(session);
     XrReferenceSpaceCreateInfo ri={.type=XR_TYPE_REFERENCE_SPACE_CREATE_INFO,.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL,
         .poseInReferenceSpace.orientation.w=1};
     XR_TRY(pCreateReferenceSpace(session,&ri,&space));
@@ -421,13 +480,16 @@ static void poll_events(void) {
         if(event.type==XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
             XrSessionState s=((XrEventDataSessionStateChanged *)&event)->state;
             LOG("[vr] session state %d\n",s);
+            focused=s==XR_SESSION_STATE_FOCUSED;
+            if(!focused)vr_input_clear();else vr_input_profiles(session);
             if(s==XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi={.type=XR_TYPE_SESSION_BEGIN_INFO,.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO};
-                if(xr_ok(pBeginSession(session,&bi),"begin session")) running=true;
-            } else if(s==XR_SESSION_STATE_STOPPING) { running=false; xr_ok(pEndSession(session),"end session"); }
-            else if(s==XR_SESSION_STATE_EXITING||s==XR_SESSION_STATE_LOSS_PENDING) { running=false; failed=true; }
+                if(xr_ok(pBeginSession(session,&bi),"begin session")){running=true;atomic_store(&pose_queries_active,true);}
+            } else if(s==XR_SESSION_STATE_STOPPING) { atomic_store(&pose_queries_active,false); running=false; xr_ok(pEndSession(session),"end session"); }
+            else if(s==XR_SESSION_STATE_EXITING||s==XR_SESSION_STATE_LOSS_PENDING) { atomic_store(&pose_queries_active,false); running=false; failed=true; }
+        } else if(event.type==XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {vr_input_profiles(session);
         } else if(event.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) { running=false; failed=true; }
-        else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) centered=false;
+        else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {pthread_mutex_lock(&camera_lock);centered=false;pthread_mutex_unlock(&camera_lock);}
         event=(XrEventDataBuffer){.type=XR_TYPE_EVENT_DATA_BUFFER};
     }
     if(r!=XR_EVENT_UNAVAILABLE) xr_ok(r,"poll events");
@@ -435,9 +497,7 @@ static void poll_events(void) {
 
 static XrPosef relative_pose(XrPosef p) { return pose_relative(center,p); }
 static XrPosef rendered_eye_pose(int i) {
-    XrPosef local=pose_relative(tracking_head,relative_pose(views[i].pose));
-    local.orientation=(XrQuaternionf){0,0,0,1};
-    return pose_compose(center,pose_compose(frame_head,local));
+    return vr_replay_eye_pose(center,frame_head,tracking_head,relative_pose(views[i].pose),late_geometry_test());
 }
 
 // Keep the projection shared by the depth and color passes. Per-draw uniform scans are unsafe.
@@ -451,10 +511,10 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
     // CameraPoseUpdater supplies the actual projection; freeze it once for both eyes and all passes.
     (void)uniforms; (void)bytes; (void)depth_minus_one;
     if(flip_y) for(int c=0;c<4;c++) p[c*4+1]=-p[c*4+1];
-    // Head motion already affected the native camera and every effect. Only apply
-    // the eye's offset/cant here; submit the actual rendered pose for compositor timewarp.
-    XrPosef pose=pose_relative(tracking_head,relative_pose(views[eye].pose));
-    pose.orientation=(XrQuaternionf){0,0,0,1}; // parallel native-camera eye views
+    // Preserve the native camera for geometry and camera-dependent lighting.
+    // Submit the recorded pose so compositor head correction moves the whole
+    // completed image together. Geometry-only late warp is diagnostic only.
+    XrPosef pose=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[eye].pose),world,late_geometry_test());
     XrFovf f=frame_fov;
     vr_eye_projection(q,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,1,100000);
     // Match game's depth convention (including reverse Z) so its depth tests remain valid.
@@ -511,6 +571,7 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
 
 bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t deadline) {
     if(!frame) return false;
+    if(!offscreen_check&&vr_enabled()&&session){poll_events();vr_input_poll(session,focused);}
     static unsigned consecutive_skips;
     static uint64_t skipped;
     bool simulation=vr_simulation_enabled();
@@ -560,7 +621,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     const char *sample_env=getenv("ODYSSEY_VR_CHECK_SAMPLES");
     if(offscreen_check && sample_env && atoi(sample_env)>1) check_samples=(unsigned)atoi(sample_env);
     if(check_samples>4) check_samples=4;
-    bool high_rate=rate_requested() && !offscreen_check && !simulation && !frame_title_menu;
+    bool high_rate=rate_requested() && !offscreen_check && (!simulation || serial_high_rate()) && !frame_title_menu;
     multiple_samples=high_rate || check_samples>1;
     bool blend=false;
     bool head_motion=previous_camera_valid && vr_head_changed(previous_head,simulation_head);
@@ -568,7 +629,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     bool stable_camera=!(motion_interp && atoi(motion_interp)) && (head_motion || previous_head_motion);
     previous_head_motion=head_motion;
     if(stable_camera) motion_frames++;
-    if(multiple_samples && !stable_camera) {
+    if(multiple_samples && !stable_camera && !serial_high_rate()) {
         uint64_t match_at=SDL_GetTicksNS();
         blend=interp_frame_begin(frame);
         cost_add(C_MATCH,match_at);
@@ -724,13 +785,21 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     uint64_t wait_at=SDL_GetTicksNS();
     if(!xr_ok(pWaitFrame(session,&wi,&fs),"wait frame")) goto done;
     cost_add(C_XRWAIT,wait_at);
+    pthread_mutex_lock(&camera_lock);
+    pose_prediction_time=fs.predictedDisplayTime;pose_prediction_host=SDL_GetTicksNS();
+    pthread_mutex_unlock(&camera_lock);
+    if(!headset_samples&&!frame_title_menu&&frame_pose_time>0)atomic_store(&camera_lead_ns,vr_prediction_lead(atomic_load(&camera_lead_ns),fs.predictedDisplayTime-frame_pose_time));
+    if(last_predicted&&fs.predictedDisplayTime>last_predicted){prediction_sum+=(uint64_t)(fs.predictedDisplayTime-last_predicted);prediction_n++;}
+    last_predicted=fs.predictedDisplayTime;
+    if(headset_samples)extra_images++;
     int64_t period=fs.predictedDisplayPeriod;
     if(period>0) {
         atomic_store(&display_period_ns,period);
         atomic_store(&target_vr_hz,(float)(1e9/period));
     }
     if(high_rate && !headset_samples) {
-        vr_rate_begin(&refresh_clock,fs.predictedDisplayTime);
+        if(serial_high_rate())vr_rate_begin_source(&refresh_clock,fs.predictedDisplayTime,(int64_t)deadline);
+        else vr_rate_begin(&refresh_clock,fs.predictedDisplayTime);
         multiple_samples=vr_rate_next_within(&refresh_clock,fs.predictedDisplayTime,period);
     }
     float alpha=high_rate?vr_rate_alpha(&refresh_clock,fs.predictedDisplayTime):1;
@@ -756,11 +825,14 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
             (vs.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)&&(vs.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT);
         bool key=SDL_GetKeyboardState(NULL)[SDL_SCANCODE_F10];
         if(rendered&&(!centered||(key&&!recenter_down))) {
+            pthread_mutex_lock(&camera_lock);
             center=views[0].pose;
             center.position.x=(views[0].pose.position.x+views[1].pose.position.x)*.5f;
             center.position.y=(views[0].pose.position.y+views[1].pose.position.y)*.5f;
             center.position.z=(views[0].pose.position.z+views[1].pose.position.z)*.5f;
-            centered=true; LOG("[vr] view recentered\n");
+            centered=true;
+            pthread_mutex_unlock(&camera_lock);
+            LOG("[vr] view recentered\n");
         }
         if(rendered) {
             update_camera_target();

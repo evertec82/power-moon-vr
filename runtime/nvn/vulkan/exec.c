@@ -4618,7 +4618,11 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     // Consume the replay draw before filtering it, so subsequent uniform records stay aligned.
     extern bool vr_filter_effects(void);
-    if (vr_filter_effects() && vr_incompatible_effect(g_cur_fs_hash)) { stat_skipped++; return; }
+    if (vr_filter_effects() && vr_incompatible_effect(g_cur_fs_hash)) {
+        static uint64_t seen[3];bool known=false;for(int i=0;i<3;i++)known|=seen[i]==g_cur_fs_hash;
+        if(!known){for(int i=0;i<3;i++)if(!seen[i]){seen[i]=g_cur_fs_hash;break;}LOG("[vr-effects] suppressed camera-sensitive fog/glow composite %016llx\n",(unsigned long long)g_cur_fs_hash);}
+        stat_skipped++; return;
+    }
     debug_raw_before(pr);  // (ODYSSEY_RAW_AT_FS: in any frame, the first draw of that program)
     if (g_debug_frame) debug_draw(pr, r, indexed);
     else {
@@ -5799,11 +5803,17 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
 }
 
 // ================================================================== executor (renderer.m exec_list)
-static void exec_list(uint64_t handle, int depth) {
-    uint64_t p = (uint64_t)(uintptr_t)cmd_list(handle);  // (records live in host memory: runtime/nvn/cmdbuf.c)
+static void exec_list(uint64_t handle,int depth);
+static void exec_records(uint64_t p,int depth,uint64_t end,uint64_t handle) {
     if (!p) return;
     for (int guard = 0; guard < 10000000; guard++) {
+        if(end && (p>=end || end-p<sizeof(CmdRec)))return;
         CmdRec *r = (CmdRec *)(uintptr_t)p;
+        if(end && (r->size<sizeof(CmdRec) || (r->size&7) || r->size>end-p || r->op>=CMD_COUNT)) {
+            LOG("[replay] invalid owned command stream; stopped\n");return;
+        }
+        if(!g_interp_replaying && r->op!=CMD_END && r->op!=CMD_JUMP && r->op!=CMD_CALL)
+            interp_command_record(r,r->size);
         void *x = r->extra;
         if (r->op < CMD_COUNT) op_counts[r->op]++;
         if (g_debug_frame) {  // ODYSSEY_DEBUG_CMDS=2: every command executed
@@ -6090,12 +6100,17 @@ static void prefetch_programs(uint64_t handle, int depth) {
     }
 }
 
+static void exec_list(uint64_t handle,int depth) {
+    exec_records((uint64_t)(uintptr_t)cmd_list(handle),depth,0,handle);
+}
+
 // Frame interpolation (runtime/nvn/interp.c): a replay of the frame's lists with the logged (blended) uniforms, from the
 // executor's state at the frame's first list (saved with the frame: the interpolation thread replays frame N while the
 // game logs N + 1) - the game's own state is restored after it.
 void renderer_interp_replay(void) {
-    const uint64_t *h;
-    uint32_t n = interp_handles(&h);
+    size_t command_bytes;
+    const void *commands=interp_commands(&command_bytes);
+    if(!commands)return;
     size_t sn;
     const void *s0 = interp_frame_state(&sn);
     if (!s0 || sn != sizeof st) return;
@@ -6119,7 +6134,7 @@ void renderer_interp_replay(void) {
         snap_reason = "eye begin"; snapshots_invalidate(NULL); nfeedback = 0;
     }
     g_twin_redirect = twins;
-    for (uint32_t i = 0; i < n; i++) exec_list(h[i], 0);
+    exec_records((uint64_t)(uintptr_t)commands,0,(uint64_t)(uintptr_t)commands+command_bytes,0);
     vk_end_pass();
     g_twin_redirect = false;
     renderer_submit();
