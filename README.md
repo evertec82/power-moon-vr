@@ -42,7 +42,7 @@ The game starts in third person. VR reserves the stick-click buttons for view sw
 
 Touch-style controllers, Index, Microsoft motion controllers and simple-controller fallback have suggested bindings. Index uses A/B on each hand; Microsoft motion controllers use trackpad click for primary and right menu for secondary. SteamVR can rebind actions. Buttons combine with gamepad input; the stronger stick vector wins. VR input clears on focus loss or stale data.
 
-The gameplay HUD is anchored to the character camera: head turns and leaning let you look around the panel, while the game camera carries it with the character view. Neutral HUD size is preserved. Headset validation is pending.
+The gameplay HUD is anchored to the character camera, retaining the v0.2.3 HUD and haptics. The launchers enable the isolated NoBloom workaround: ODYSSEY_VR_BLOOM_DIAG=off removes the identified HDR bloom input from both native and stereo replay frames. Fog and lens flares remain enabled; native camera blur remains disabled. The owner confirmed the NoBloom result and reported improved judder with the pose guard; longer testing remains open.
 
 Game vibration drives the gamepad motors and the corresponding left/right VR controllers. **Controls → Vibration** controls both; **Test vibration** sends a short pulse to connected devices. Switch HD-rumble amplitudes are approximated on ordinary motors/OpenXR pulses, with bounded duration and stale-input expiry. Physical controller testing of VR haptics is pending.
 
@@ -55,8 +55,9 @@ Game vibration drives the gamepad motors and the corresponding left/right VR con
 - Optional first-person camera at Mario's head position, levelled against gravity, using existing head tracking. His displayed model is hidden while that view is applied and restored on return to third person.
 - Conservative shadow sharing, cached shader fingerprints, folded eligible eye clears, and nonblocking desktop mirroring reduce repeated work.
 - Unsupported HTML help/manual pages close immediately in VR instead of blocking on a desktop-only notice.
+- Native pose-query timestamps cannot move backward within the current recenter/reference-space epoch. Failed fresh queries retain the last applied pose and timestamp. This reduces a possible stale-pose transition without changing render threading; occasional below-refresh judder may remain.
 - Frame-owned replay commands remove a live command-handle lifetime hazard, and optional native camera-time queries reduce pose age while preserving consistent geometry/lighting poses.
-- Native camera blur is disabled by default in VR. The game triggers this effect from horizontal camera-angle changes, which produced distracting light smearing during fast head or stick turns. This uses the game's system control and preserves bloom, fog, lighting and lens flares. Set `ODYSSEY_VR_CAMERA_BLUR=on` to compare; the shipped launchers explicitly select `off`. The owner reported initial improvement; extended testing is pending.
+- Native camera blur is disabled by default in VR. The game triggers this effect from horizontal camera-angle changes, which produced distracting light smearing during fast head or stick turns. This uses the game's system control and preserves fog, lighting and lens flares; the separate NoBloom workaround suppresses the identified HDR bloom input. Set `ODYSSEY_VR_CAMERA_BLUR=on` to compare; the shipped launchers explicitly select `off`. The owner reported initial improvement; extended testing is pending.
 
 2×, 3×, 4× and 5× launchers are shipped. Display interpolation, repeated-image scheduling and the asynchronous completion-worker experiment are disabled.
 

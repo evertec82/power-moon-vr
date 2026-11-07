@@ -206,6 +206,8 @@ static void title_scene_control(Cpu *c) {
 
 void odyssey_boot(void) {
 #ifndef __APPLE__
+    extern void odyssey_vr_lighting_init(void);
+    odyssey_vr_lighting_init();
     extern void vr_set_title_menu(bool);
     vr_set_title_menu(false);
 #endif

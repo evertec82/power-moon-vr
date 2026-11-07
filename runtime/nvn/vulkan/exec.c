@@ -1,3 +1,4 @@
+#include "vr_bloom.h"
 // Executes recorded NVN command lists with Vulkan (port of renderer.m; same structure, same behaviour).
 #include <SDL3/SDL_cpuinfo.h>
 #include <SDL3/SDL_timer.h>
@@ -4892,6 +4893,39 @@ static void draw_(CmdRec *r, bool indexed) {
     for (int i = 0; i < pr->fi->ntex && i < 64; i++) {
         float sc[2]; uint32_t wh[2];
         texture_info(1, pr->fi, i, &fii[i], sc, wh);
+        // The resource layout covers HDR program permutations without relying
+        // on a single fragment-program fingerprint.
+        extern int vr_eye_index(void);
+        extern bool vr_enabled(void);
+        static int bloom_diag=-1;
+        if(bloom_diag<0) {
+            const char *e=getenv("ODYSSEY_VR_BLOOM_DIAG");
+            bloom_diag=e && !strcmp(e,"off");
+        }
+        // Replays can seed carry images from the native frame. Keep that frame
+        // free of bloom too, or a partial/reused image can reintroduce the glow.
+        if(i==0 && bloom_diag && vr_enabled() && pr->fi->ntex>=2 &&
+           st.rt.ncolor && st.rt.color[0] && !st.ds[0] && r->x[2]==3) {
+            NvnTexture *target=st.rt.color[0];
+            NvnTexture *bloom=shader_texture_object(1,&pr->fi->tex[0]);
+            NvnTexture *scene=shader_texture_object(1,&pr->fi->tex[1]);
+            if(bloom && scene && vr_bloom_compose(r->x[2],st.ds[0],pr->vi->attr_mask,
+                target->format,target->width,target->height,
+                bloom->format,bloom->width,bloom->height,scene->format,scene->width,scene->height)) {
+                fii[i].imageView=vk_dummy_view(TEXTYPE_2D);
+                static struct { uint64_t hash; bool native; } seen[16];
+                static unsigned nseen;
+                bool native=vr_eye_index()<0;
+                bool known=false;
+                for(unsigned j=0;j<nseen;j++) known|=seen[j].hash==g_cur_fs_hash && seen[j].native==native;
+                if(!known && nseen<16) {
+                    seen[nseen].hash=g_cur_fs_hash;seen[nseen++].native=native;
+                    LOG("[vr-lighting] %s HDR bloom input off: variant %016llx, %d textures, bloom %ux%u, scene %ux%u\n",
+                        native?"native":"eye",(unsigned long long)g_cur_fs_hash,pr->fi->ntex,bloom->width,bloom->height,scene->width,scene->height);
+                }
+            }
+        }
+
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;

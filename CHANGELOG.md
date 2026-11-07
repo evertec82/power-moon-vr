@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.4
+
+- Guard native pose-query targets against backward time steps when cadence/prediction lead changes. Retain the last applied pose and timestamp on a failed fresh query; add diagnostic counters. Rendering threads, serial retirement and pacing settings remain unchanged.
+
+- Restore the isolated NoBloom HDR-composition input filter on native and eye replays in all resolution launchers. Keep camera-anchored HUD, haptics and native camera-blur fix. Fog and lens flares remain enabled. The owner confirmed that NoBloom looks good and the pose-guard test improves judder.
+
 ## v0.2.3
 
 - Anchor gameplay HUD layouts and text to the character-camera panel instead of the headset. Preserve neutral size, project clipping bounds with the panel, and use the scene pose for compositor reprojection. Headset validation pending.

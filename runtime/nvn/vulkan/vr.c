@@ -62,6 +62,8 @@ static bool multiple_samples,previous_camera_valid;
 static _Atomic bool pose_queries_active;
 static _Atomic int64_t camera_lead_ns;
 static _Atomic uint64_t native_query_ns,native_query_n;
+static _Atomic uint64_t native_time_clamps,native_query_failures;
+static int64_t last_native_query_time;
 static int64_t pose_prediction_time,applied_pose_time,frame_pose_time;
 static uint64_t pose_prediction_host;
 static _Atomic bool title_menu_active;
@@ -176,6 +178,8 @@ static void rate_stats(bool game,bool rendered,bool blended) {
         }
         uint64_t query_n=atomic_exchange(&native_query_n,0),query_ns=atomic_exchange(&native_query_ns,0);
         if(query_n)LOG("[vr-pose] native camera query %.3f ms/call; adaptive lead %.2f ms; %llu queries\n",query_ns/(double)query_n/1e6,atomic_load(&camera_lead_ns)/1e6,(unsigned long long)query_n);
+        uint64_t clamps=atomic_exchange(&native_time_clamps,0),fallbacks=atomic_exchange(&native_query_failures,0);
+        if(clamps||fallbacks)LOG("[vr-pose] held monotonic query time %llu; retained recorded pose after query failure %llu\n",(unsigned long long)clamps,(unsigned long long)fallbacks);
         if(cost_n[C_ACQUIRE]) LOG("[vr-transfer] acquire %.2f ms/eye, copy submit %.2f ms/eye\n",cost_ms(C_ACQUIRE),cost_ms(C_COPY));
         if(frame_metrics.count) {
             LOG("[vr-pacing] delivery p50 %.2f p95 %.2f p99 %.2f ms; longest %.2f ms; %u intervals\n",
@@ -223,6 +227,11 @@ static bool query_native_head(XrPosef *head,int64_t *pose_time) {
     uint64_t now=SDL_GetTicksNS();int64_t target;XrPosef anchor;
     pthread_mutex_lock(&camera_lock);
     bool valid=centered&&vr_prediction_target(pose_prediction_time,pose_prediction_host,now,atomic_load(&camera_lead_ns),&target);
+    if(valid) {
+        int64_t forward=vr_prediction_forward(target,last_native_query_time);
+        if(forward!=target)atomic_fetch_add(&native_time_clamps,1);
+        target=forward;
+    }
     anchor=center;
     pthread_mutex_unlock(&camera_lock);
     if(!valid)return false;
@@ -231,11 +240,16 @@ static bool query_native_head(XrPosef *head,int64_t *pose_time) {
     XrViewLocateInfo li={.type=XR_TYPE_VIEW_LOCATE_INFO,.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,.displayTime=target,.space=space};
     XrResult r=pLocateViews(session,&li,&state,2,&n,v);
     atomic_fetch_add(&native_query_ns,SDL_GetTicksNS()-now);atomic_fetch_add(&native_query_n,1);
-    if(XR_FAILED(r)||n!=2||!(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)||!(state.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT))return false;
+    if(XR_FAILED(r)||n!=2||!(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)||!(state.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT)) {
+        atomic_fetch_add(&native_query_failures,1);return false;
+    }
     *head=pose_relative(anchor,v[0].pose);XrPosef right=pose_relative(anchor,v[1].pose);
     head->position.x=(head->position.x+right.position.x)*.5f;
     head->position.y=(head->position.y+right.position.y)*.5f;
     head->position.z=(head->position.z+right.position.z)*.5f;
+    pthread_mutex_lock(&camera_lock);
+    last_native_query_time=vr_prediction_forward(target,last_native_query_time);
+    pthread_mutex_unlock(&camera_lock);
     *pose_time=target;return true;
 }
 static CameraBase camera_base[16];
@@ -253,7 +267,14 @@ void vr_apply_game_camera(float *fields) {
     if(entry && entry->used && !memcmp(base+12,entry->last+12,9*sizeof(float))) memcpy(base,entry->base,sizeof base);
     XrPosef h=native_head;
     pthread_mutex_unlock(&camera_lock);
-    int64_t queried_time=0;query_native_head(&h,&queried_time);
+    int64_t queried_time=0;
+    if(!query_native_head(&h,&queried_time) && native_pose_query_enabled() && !offscreen_check) {
+        // The image and submitted pose must describe the same camera. A failed
+        // fresh query must not switch back to the older render-thread sample.
+        pthread_mutex_lock(&camera_lock);
+        if(applied_pose_time>0){h=applied_head;queried_time=applied_pose_time;}
+        pthread_mutex_unlock(&camera_lock);
+    }
     float original_base[21];memcpy(original_base,base,sizeof base);
     bool fp=false;
     if(vr_first_person_requested()) {
@@ -490,7 +511,7 @@ static void poll_events(void) {
             else if(s==XR_SESSION_STATE_EXITING||s==XR_SESSION_STATE_LOSS_PENDING) { atomic_store(&pose_queries_active,false); running=false; failed=true; }
         } else if(event.type==XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {vr_input_profiles(session);
         } else if(event.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) { running=false; failed=true; }
-        else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {pthread_mutex_lock(&camera_lock);centered=false;pthread_mutex_unlock(&camera_lock);}
+        else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {pthread_mutex_lock(&camera_lock);centered=false;last_native_query_time=0;applied_pose_time=0;pthread_mutex_unlock(&camera_lock);}
         event=(XrEventDataBuffer){.type=XR_TYPE_EVENT_DATA_BUFFER};
     }
     if(r!=XR_EVENT_UNAVAILABLE) xr_ok(r,"poll events");
@@ -828,6 +849,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
             center.position.y=(views[0].pose.position.y+views[1].pose.position.y)*.5f;
             center.position.z=(views[0].pose.position.z+views[1].pose.position.z)*.5f;
             centered=true;
+            last_native_query_time=0;applied_pose_time=0;
             pthread_mutex_unlock(&camera_lock);
             LOG("[vr] view recentered\n");
         }
