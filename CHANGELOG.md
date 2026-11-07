@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.6
+
+- Correct the repository's 4x launcher to internal scale 2 (3840x2160), matching the packaged 4x preset. Runtime and five resolution choices remain unchanged. QPC/guard-band experiments remain excluded.
+
 ## v0.2.5
 
 - Relabel resolution presets 2x/3x/4x/5x as 4x/6x/8x/10x without changing their render sizes. Add 9x at 8640x4860 (ODYSSEY_SCALE=4.5). These are preset labels, not literal total-pixel multipliers.
