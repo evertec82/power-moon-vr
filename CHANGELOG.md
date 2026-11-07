@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.5
+
+- Relabel resolution presets 2x/3x/4x/5x as 4x/6x/8x/10x without changing their render sizes. Add 9x at 8640x4860 (ODYSSEY_SCALE=4.5). These are preset labels, not literal total-pixel multipliers.
+- Retain the v0.2.4 executable with NoBloom, native camera-blur control, pose timing guard, camera-anchored HUD and controller haptics. The QPC/guard-band experiments were not promoted and are excluded.
+
 ## v0.2.4
 
 - Guard native pose-query targets against backward time steps when cadence/prediction lead changes. Retain the last applied pose and timestamp on a failed fresh query; add diagnostic counters. Rendering threads, serial retirement and pacing settings remain unchanged.
