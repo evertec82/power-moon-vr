@@ -30,6 +30,9 @@ From an MSYS2 UCRT64 shell, or Git Bash with MSYS2 first on PATH:
   process waits for it and passes its exit code on.
 
 ## Tests
+
+- `clang -O2 -Ithird_party/openxr/include tools/vr_stereo_test.c -o build/vr_stereo_test.exe && build/vr_stereo_test.exe`: canted/asymmetric eye poses, IPD, projection boundaries, HUD and render/submission agreement. Also run `vr_camera_test.c`, `vr_serial_pose_test.c`, `vr_hud_test.c` and `vr_math_test.c` the same way.
+- The local offscreen gameplay replay check accepts `ODYSSEY_VR_CHECK_CANT=15` with `ODYSSEY_VR_CHECK_POSE=1` to exercise synthetic canted/asymmetric eyes. It does not substitute for testing on a physical Pimax headset. Shipped launchers clear this diagnostic option.
 - `tools/test_translate.sh`: shader translator fuzz (MSL output unchanged, GLSL compiles and validates).
 - `tools/test_vk_pipelines.sh`: fuzzed shaders through the backend's compile/reflection into real pipelines.
 - `tools/odyssey_run.sh`: build, boot into the game on a copy of a save (`build/testsave`), show the log.

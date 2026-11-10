@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.7
+
+- Address stereo alignment on Pimax and other canted-display headsets: preserve the runtime's eye orientations and asymmetric FOVs, use a binocular midpoint for native tracking/recentering, and submit the same per-eye pose/FOV used to render.
+- Project the camera-anchored HUD through each eye's optical frustum while retaining its shared physical panel size. Keep the existing pose timing, NoBloom, haptics and five resolution presets.
+- Add canted/asymmetric stereo regression coverage and an opt-in synthetic-cant gameplay check. Physical Pimax confirmation remains pending; this release does not claim a general judder or peripheral-culling fix.
+
 ## v0.2.6
 
 - Correct the repository's 4x launcher to internal scale 2 (3840x2160), matching the packaged 4x preset. Runtime and five resolution choices remain unchanged. QPC/guard-band experiments remain excluded.

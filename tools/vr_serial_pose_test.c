@@ -10,7 +10,7 @@ int main(void){
   float yaw=sinf(frame*.13f)*.5f;XrPosef head={.orientation={0,sinf(yaw),0,cosf(yaw)},.position={frame*.002f,.15f,-.1f}};
   for(int i=0;i<2;i++){
    XrPosef local={.orientation={0,sinf(.02f),0,cosf(.02f)},.position={i?.032f:-.032f,0,0}};
-   XrPosef eye=pose_compose(head,local);local.orientation=(XrQuaternionf){0,0,0,1};
+   XrPosef eye=pose_compose(head,local);
    XrPosef want=pose_compose(head,local);
    XrPosef delta=vr_replay_eye_delta(recorded,head,eye,true,true);
    float a[16],b[16],actual[16],expected[16];view(a,delta);view(b,recorded);vr_multiply(actual,a,b);view(expected,want);
@@ -23,8 +23,8 @@ int main(void){
    for(int j=0;j<16;j++)near(actual[j],expected[j]);
    XrPosef fixed_pose=vr_replay_eye_pose(origin,recorded,head,eye,false);
    view(actual,pose_relative(origin,fixed_pose));for(int j=0;j<16;j++)near(actual[j],expected[j]);
-   near(fixed_delta.orientation.w,1);near(fixed_delta.orientation.y,0);
-   XrPosef hud=vr_replay_eye_delta(recorded,head,eye,false,true);near(hud.orientation.w,1);near(hud.position.x,local.position.x);
+   near(fixed_delta.orientation.w,local.orientation.w);near(fixed_delta.orientation.y,local.orientation.y);
+   XrPosef hud=vr_replay_eye_delta(recorded,head,eye,false,true);near(hud.orientation.w,local.orientation.w);near(hud.position.x,local.position.x);
   }
  }
  puts("Recorded camera and submission stay consistent as prediction changes; geometry/shadow camera is not late-rotated; diagnostic late-pose math also passes");

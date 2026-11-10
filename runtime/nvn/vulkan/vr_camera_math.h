@@ -60,12 +60,26 @@ static bool vr_lookat_head(float out[21],const float base[21],XrPosef head,float
     return true;
 }
 
-// A shared symmetric render frustum lets native screen-space effects use the same
-// projection in both eyes. OpenXR receives this actual render FOV and camera pose.
+// Use the binocular midpoint, including orientation. A left-eye reference bakes
+// display cant into native camera tracking and recentering.
+static XrPosef vr_head_from_views(const XrView views[2]) {
+    XrPosef out=views[0].pose;XrQuaternionf a=out.orientation,b=views[1].pose.orientation;
+    float sign=a.x*b.x+a.y*b.y+a.z*b.z+a.w*b.w<0?-1:1;
+    out.orientation=(XrQuaternionf){a.x+sign*b.x,a.y+sign*b.y,a.z+sign*b.z,a.w+sign*b.w};
+    float n=sqrtf(out.orientation.x*out.orientation.x+out.orientation.y*out.orientation.y+
+                  out.orientation.z*out.orientation.z+out.orientation.w*out.orientation.w);
+    if(n>.00001f){out.orientation.x/=n;out.orientation.y/=n;out.orientation.z/=n;out.orientation.w/=n;}
+    else out.orientation=(XrQuaternionf){0,0,0,1};
+    out.position=(XrVector3f){(views[0].pose.position.x+views[1].pose.position.x)*.5f,
+        (views[0].pose.position.y+views[1].pose.position.y)*.5f,(views[0].pose.position.z+views[1].pose.position.z)*.5f};
+    return out;
+}
+// The native camera still needs one symmetric culling/effect frustum. Actual
+// eye rendering and submission use each runtime FOV and preserve display cant.
 static bool vr_enclosing_fov(XrFovf *out,const XrView views[2]) {
-    float h=0,v=0;
+    float h=0,v=0;XrPosef head=vr_head_from_views(views);
     for(int i=0;i<2;i++) {
-        XrPosef eye=pose_relative(views[0].pose,views[i].pose);
+        XrPosef eye=pose_relative(head,views[i].pose);
         XrQuaternionf q=eye.orientation;
         float rotation[16]; vr_pose_inverse(rotation,-q.x,-q.y,-q.z,q.w,0,0,0);
         float xs[2]={tanf(views[i].fov.angleLeft),tanf(views[i].fov.angleRight)};
@@ -74,9 +88,11 @@ static bool vr_enclosing_fov(XrFovf *out,const XrView views[2]) {
             float a=rotation[0]*xs[x]+rotation[4]*ys[y]-rotation[8];
             float b=rotation[1]*xs[x]+rotation[5]*ys[y]-rotation[9];
             float z=rotation[2]*xs[x]+rotation[6]*ys[y]-rotation[10];
-            if(z>=-.001f) return false;
-            h=fmaxf(h,atan2f(fabsf(a),-z));
-            v=fmaxf(v,atan2f(fabsf(b),-z));
+            // A forward perspective native camera cannot enclose rays behind
+            // the head. Bound only native culling; never clamp the eye FOVs.
+            const float limit=1.49f;
+            h=fmaxf(h,fminf(limit,atan2f(fabsf(a),-z)));
+            v=fmaxf(v,fminf(limit,atan2f(fabsf(b),-z)));
         }
     }
     if(h<.1f||v<.1f||h>1.5f||v>1.5f) return false;
@@ -113,7 +129,6 @@ static bool vr_head_changed(XrPosef a,XrPosef b) {
 // uniforms retain their recorded pose; every world pass receives one shared delta.
 static XrPosef vr_replay_eye_delta(XrPosef recorded,XrPosef predicted,XrPosef predicted_eye,bool world,bool late) {
     XrPosef local=pose_relative(predicted,predicted_eye);
-    local.orientation=(XrQuaternionf){0,0,0,1};
     if(!late||!world)return local;
     return pose_relative(recorded,pose_compose(predicted,local));
 }

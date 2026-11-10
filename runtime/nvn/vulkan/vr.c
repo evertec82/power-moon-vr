@@ -243,10 +243,7 @@ static bool query_native_head(XrPosef *head,int64_t *pose_time) {
     if(XR_FAILED(r)||n!=2||!(state.viewStateFlags&XR_VIEW_STATE_ORIENTATION_VALID_BIT)||!(state.viewStateFlags&XR_VIEW_STATE_POSITION_VALID_BIT)) {
         atomic_fetch_add(&native_query_failures,1);return false;
     }
-    *head=pose_relative(anchor,v[0].pose);XrPosef right=pose_relative(anchor,v[1].pose);
-    head->position.x=(head->position.x+right.position.x)*.5f;
-    head->position.y=(head->position.y+right.position.y)*.5f;
-    head->position.z=(head->position.z+right.position.z)*.5f;
+    *head=pose_relative(anchor,vr_head_from_views(v));
     pthread_mutex_lock(&camera_lock);
     last_native_query_time=vr_prediction_forward(target,last_native_query_time);
     pthread_mutex_unlock(&camera_lock);
@@ -537,13 +534,13 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
     // Submit the recorded pose so compositor head correction moves the whole
     // completed image together. Geometry-only late warp is diagnostic only.
     XrPosef pose=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[eye].pose),world,late_geometry_test());
-    XrFovf f=frame_fov;
+    XrFovf f=views[eye].fov;
     vr_eye_projection(q,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,1,100000);
     // Match game's depth convention (including reverse Z) so its depth tests remain valid.
     q[10]=p[10]; q[14]=p[14];
     if(!world) {
         XrPosef delta=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[eye].pose),true,late_geometry_test());
-        vr_hud_matrix(out,pose_compose(frame_head,delta),frame_fov,vr_ui_scale());
+        vr_hud_eye_matrix(out,pose_compose(frame_head,delta),frame_fov,f,vr_ui_scale());
         return;
     }
     if(!vr_inverse(inv,p)) return;
@@ -733,6 +730,12 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                     pthread_mutex_unlock(&camera_lock);
                     views[i].pose=pose_compose(head,(XrPosef){.orientation={0,0,0,1},.position={i?.032f:-.032f,0,0}});
                     views[i].fov=(XrFovf){-.9f,.9f,.9f,-.9f};
+                    const char *cant=getenv("ODYSSEY_VR_CHECK_CANT");
+                    if(cant){
+                        float half=strtof(cant,NULL)*.00872664626f;
+                        views[i].pose=pose_compose(head,(XrPosef){.orientation={0,i?-sinf(half):sinf(half),0,cosf(half)},.position={i?.032f:-.032f,0,0}});
+                        views[i].fov=i?(XrFovf){-.67f,1.04f,.82f,-.71f}:(XrFovf){-1.04f,.67f,.79f,-.75f};
+                    }
                 }
                 extern bool g_debug_frame;
                 g_debug_frame=capture && i==1 && getenv("ODYSSEY_VR_CHECK_PASSES");
@@ -844,10 +847,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         bool key=SDL_GetKeyboardState(NULL)[SDL_SCANCODE_F10];
         if(rendered&&(!centered||(key&&!recenter_down))) {
             pthread_mutex_lock(&camera_lock);
-            center=views[0].pose;
-            center.position.x=(views[0].pose.position.x+views[1].pose.position.x)*.5f;
-            center.position.y=(views[0].pose.position.y+views[1].pose.position.y)*.5f;
-            center.position.z=(views[0].pose.position.z+views[1].pose.position.z)*.5f;
+            center=vr_head_from_views(views);
             centered=true;
             last_native_query_time=0;applied_pose_time=0;
             pthread_mutex_unlock(&camera_lock);
@@ -855,10 +855,15 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         }
         if(rendered) {
             update_camera_target();
-            XrPosef head=relative_pose(views[0].pose),right=relative_pose(views[1].pose);
-            head.position.x=(head.position.x+right.position.x)*.5f;
-            head.position.y=(head.position.y+right.position.y)*.5f;
-            head.position.z=(head.position.z+right.position.z)*.5f;
+            static bool stereo_logged;
+            if(!stereo_logged){
+                stereo_logged=true;XrPosef left=pose_relative(vr_head_from_views(views),views[0].pose),right=pose_relative(vr_head_from_views(views),views[1].pose);
+                float dx=left.position.x-right.position.x,dy=left.position.y-right.position.y,dz=left.position.z-right.position.z;
+                LOG("[vr-stereo] runtime eye poses and asymmetric FOVs preserved; IPD %.2f mm; eye yaw %.2f / %.2f deg; horizontal FOV %.2f..%.2f / %.2f..%.2f deg\n",
+                    sqrtf(dx*dx+dy*dy+dz*dz)*1000,2*atan2f(left.orientation.y,left.orientation.w)*57.2957795f,2*atan2f(right.orientation.y,right.orientation.w)*57.2957795f,
+                    views[0].fov.angleLeft*57.2957795f,views[0].fov.angleRight*57.2957795f,views[1].fov.angleLeft*57.2957795f,views[1].fov.angleRight*57.2957795f);
+            }
+            XrPosef head=relative_pose(vr_head_from_views(views));
             pthread_mutex_lock(&camera_lock);
             tracking_head=head;
             native_head=head;
@@ -907,7 +912,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         eye=-1;
 
         projection[i]=(XrCompositionLayerProjectionView){.type=XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW,
-            .pose=rendered_eye_pose(i),.fov=frame_fov,.subImage={.swapchain=targets[i].swapchain,
+            .pose=rendered_eye_pose(i),.fov=views[i].fov,.subImage={.swapchain=targets[i].swapchain,
                 .imageRect={{0,0},{(int32_t)targets[i].width,(int32_t)targets[i].height}},.imageArrayIndex=0}};
         if(!rendered) break;
     }

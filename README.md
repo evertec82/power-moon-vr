@@ -48,6 +48,7 @@ Game vibration drives the gamepad motors and the corresponding left/right VR con
 
 ## Current behavior
 
+- v0.2.7 addresses stereo alignment on canted-display headsets by preserving each OpenXR eye orientation and asymmetric FOV, using a centered head reference, and matching rendered/submitted views. The HUD uses the same per-eye optics. Synthetic regression and gameplay checks are provided; physical Pimax confirmation is still needed. The game's shared native culling frustum remains bounded for extremely wide peripheral views.
 - Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
 - Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.
 - A fixed title panel and a character-camera-anchored gameplay HUD at 65% neutral scale.

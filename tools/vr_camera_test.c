@@ -51,6 +51,6 @@ int main(void) {
     close_value(enclosing.angleRight,.8f); close_value(enclosing.angleUp,.7f);
     eyes[1].pose.orientation=(XrQuaternionf){0,sinf(.1f),0,cosf(.1f)};
     assert(vr_enclosing_fov(&enclosing,eyes));
-    assert(enclosing.angleRight>.999f && enclosing.angleRight<1.001f);
+    assert(enclosing.angleRight>.899f && enclosing.angleRight<.901f);
     puts("Native camera and OpenXR pose/frustum tests passed");
 }
