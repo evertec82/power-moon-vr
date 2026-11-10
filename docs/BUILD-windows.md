@@ -31,6 +31,7 @@ From an MSYS2 UCRT64 shell, or Git Bash with MSYS2 first on PATH:
 
 ## Tests
 
+- Build and run `tools/vr_reconstruction_test.c` with the same command below: per-eye screen-shadow lookups, projection/inverse-projection uniforms, both clip-depth conventions, canted/asymmetric eyes and unchanged unrelated data. Gameplay logs report `[vr-effects]` separately for each eye when the correction applies.
 - `clang -O2 -Ithird_party/openxr/include tools/vr_stereo_test.c -o build/vr_stereo_test.exe && build/vr_stereo_test.exe`: canted/asymmetric eye poses, IPD, projection boundaries, HUD and render/submission agreement. Also run `vr_camera_test.c`, `vr_serial_pose_test.c`, `vr_hud_test.c` and `vr_math_test.c` the same way.
 - The local offscreen gameplay replay check accepts `ODYSSEY_VR_CHECK_CANT=15` with `ODYSSEY_VR_CHECK_POSE=1` to exercise synthetic canted/asymmetric eyes. It does not substitute for testing on a physical Pimax headset. Shipped launchers clear this diagnostic option.
 - `tools/test_translate.sh`: shader translator fuzz (MSL output unchanged, GLSL compiles and validates).

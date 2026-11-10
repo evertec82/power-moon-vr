@@ -667,6 +667,9 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     return s;
 }
 
+// Set per draw, before either shader stage uploads its uniform buffers.
+static bool vr_screen_reconstruction,vr_screen_shadow;
+
 // ================================================================== worker threads (shader / pipeline builds)
 // First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
 // ODYSSEY_SYNC_SHADERS=1 builds on first use, blocking (deterministic tests).
@@ -3837,6 +3840,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // compared over the bytes the shader reads)
     uint64_t src = r.addr;
     if (g_interp_log && stage < 2) src = (uint64_t)(uintptr_t)interp_cbuf(stage, k, idx, (const void *)(uintptr_t)r.addr, size, si->cbuf_size[k]);
+    if(stage<2 && vr_screen_reconstruction && size>=64 && size<=65536) {
+        extern unsigned vr_reconstruction_uniforms(float *,const float *,uint64_t,bool);
+        static float corrected[65536/sizeof(float)];
+        if(vr_reconstruction_uniforms(corrected,(const float *)(uintptr_t)src,size,vr_screen_shadow && k==3 && r.size==608))
+            return ubo_span(vk_transient_copy(corrected,size,256),size);
+    }
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
@@ -4541,6 +4550,7 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
 }
 
 static void draw_(CmdRec *r, bool indexed) {
+    vr_screen_reconstruction=vr_screen_shadow=false;
     float ui_scale=1;
     bool hud_panel=false;
     float hud_matrix[16];
@@ -4777,6 +4787,11 @@ static void draw_(CmdRec *r, bool indexed) {
                                      primary->height*divisor==(uint32_t)st.viewport[0][3];
             if(vr_depth_screen_pass(r->x[2],pr->vi->cbuf_mask,pr->vi->attr_mask,screen_source))
                 kind=VR_PASS_SCREEN;
+            NvnTexture *target=st.rt.ncolor?st.rt.color[0]:NULL;
+            vr_screen_reconstruction=kind==VR_PASS_SCREEN && screen_source && target &&
+                target->width>=160 && target->height>=90 && target->width>target->height*1.70f && target->width<target->height*1.82f;
+            vr_screen_shadow=vr_screen_reconstruction && primary && renderer_format_is_depth(primary->format) &&
+                pr->fi->ntex>=2 && pr->fi->tex[1].shadow;
         }
         // Only actual layout elements on a screen-shaped canvas shrink.
         // Full-screen captures, fades and reconstruction passes keep their full viewport.

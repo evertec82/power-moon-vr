@@ -19,6 +19,7 @@
 #include "vr_camera_state.h"
 #include "vr_menu.h"
 #include "vr_hud.h"
+#include "vr_reconstruction.h"
 #include "vr_first_person.h"
 #include "../../cpu.h"
 #include "../renderer.h"
@@ -552,7 +553,9 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
 
 static float eye_clip_cache[2][2][16];
 static bool eye_clip_valid[2][2];
-void vr_eye_replay_begin(void) { memset(eye_clip_valid,0,sizeof eye_clip_valid); }
+static bool reconstruction_valid,reconstruction_ready;
+static float reconstruction_native[16],reconstruction_inv_native[16],reconstruction_eye[16],reconstruction_inv_eye[16],reconstruction_view[16];
+void vr_eye_replay_begin(void) { memset(eye_clip_valid,0,sizeof eye_clip_valid);reconstruction_valid=false; }
 void vr_clip_matrix(float out[16],bool world,bool flip_y,bool depth_minus_one,const void *uniforms,uint64_t bytes) {
     if(eye<0 || frame_title_menu) { vr_identity(out); return; }
     if(!eye_clip_valid[world][flip_y]) {
@@ -560,6 +563,21 @@ void vr_clip_matrix(float out[16],bool world,bool flip_y,bool depth_minus_one,co
         eye_clip_valid[world][flip_y]=true;
     }
     memcpy(out,eye_clip_cache[world][flip_y],16*sizeof(float));
+}
+
+unsigned vr_reconstruction_uniforms(float *out,const float *in,uint64_t bytes,bool shadow) {
+    if(eye<0||frame_title_menu||bytes<64||bytes>65536)return 0;
+    if(!reconstruction_valid){
+        float clip[16];vr_clip_matrix(clip,true,false,false,NULL,0);
+        reconstruction_ready=vr_reconstruction_matrices(reconstruction_native,reconstruction_inv_native,
+            reconstruction_eye,reconstruction_inv_eye,reconstruction_view,frame_projection,clip);
+        reconstruction_valid=true;
+    }
+    if(!reconstruction_ready)return 0;
+    unsigned n=vr_reconstruction_patch(out,in,bytes,shadow,reconstruction_native,reconstruction_inv_native,
+        reconstruction_eye,reconstruction_inv_eye,reconstruction_view);
+    if(n){static bool reported[2][2];if(!reported[eye][shadow]){reported[eye][shadow]=true;LOG("[vr-effects] eye %d %s camera correction active (%u matrices)\n",eye,shadow?"shadow resolve":"depth reconstruction",n);}}
+    return n;
 }
 
 static bool copy_eye(TexBackend *src,int i,uint32_t idx) {

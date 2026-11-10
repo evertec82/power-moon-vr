@@ -32,6 +32,7 @@ bool vr_multiple_samples(void);
 bool vr_fps(float *submitted,float *target);
 
 void vr_eye_replay_begin(void);
+unsigned vr_reconstruction_uniforms(float *out,const float *in,uint64_t bytes,bool shadow);
 
 float vr_ui_scale(void);
 bool vr_hud_camera_fixed(void);

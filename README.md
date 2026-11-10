@@ -48,6 +48,7 @@ Game vibration drives the gamepad motors and the corresponding left/right VR con
 
 ## Current behavior
 
+- v0.2.8 corrects per-eye reconstruction in the screen-space shadow resolve and matching depth-based effects. Both eyes use the camera mapping that produced their depth images; the existing bloom setting and pose timing are retained. Confirmation of the reported missing effects on physical headsets is still needed.
 - v0.2.7 addresses stereo alignment on canted-display headsets by preserving each OpenXR eye orientation and asymmetric FOV, using a centered head reference, and matching rendered/submitted views. The HUD uses the same per-eye optics. Synthetic regression and gameplay checks are provided; physical Pimax confirmation is still needed. The game's shared native culling frustum remains bounded for extremely wide peripheral views.
 - Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
 - Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.

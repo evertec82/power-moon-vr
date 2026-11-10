@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.8
+
+- Correct the screen-space shadow resolve's view-to-shadow lookup for each rendered eye instead of reconstructing both eyes with the center camera. Preserve the canted-display alignment introduced in v0.2.7.
+- Update matching native projection/inverse-projection uniforms in depth-reading screen effects to the rendered eye's clip space, including the game's -1..1 versus Vulkan 0..1 depth conversion. Leave world, HUD and light-camera draws unchanged.
+- Add per-eye shadow/depth reconstruction regression checks for cant, asymmetric FOV, eye separation and reversed depth. Existing resolution presets, NoBloom, haptics and pose timing remain unchanged. Physical headset confirmation of the reported one-eye effects remains pending.
+
 ## v0.2.7
 
 - Address stereo alignment on Pimax and other canted-display headsets: preserve the runtime's eye orientations and asymmetric FOVs, use a binocular midpoint for native tracking/recentering, and submit the same per-eye pose/FOV used to render.
