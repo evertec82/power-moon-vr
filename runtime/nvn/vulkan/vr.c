@@ -54,7 +54,9 @@ static struct {
     XrSwapchain swapchain;
     uint32_t count, width, height;
     XrSwapchainImageVulkanKHR *images;
+    VkImageView *color_views;
 } targets[2];
+static VkFormat eye_format;
 static uint64_t frame_count;
 static VrRateClock refresh_clock;
 static _Atomic int64_t display_period_ns;
@@ -479,6 +481,7 @@ void vr_session_init(void) {
         for(uint32_t j=0;j<nf;j++) if(formats[j]==candidates[i]) { format=candidates[i]; break; }
     free(formats);
     if(!format) { LOG("[vr] no compatible OpenXR color format\n"); failed=true; return; }
+    eye_format = format;
     for(int i=0;i<2;i++) {
         targets[i].width=config[i].recommendedImageRectWidth;
         targets[i].height=config[i].recommendedImageRectHeight;
@@ -489,6 +492,17 @@ void vr_session_init(void) {
         targets[i].images=calloc(targets[i].count,sizeof *targets[i].images);
         for(uint32_t j=0;j<targets[i].count;j++) targets[i].images[j].type=XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
         XR_TRY(pEnumerateSwapchainImages(targets[i].swapchain,targets[i].count,&targets[i].count,(XrSwapchainImageBaseHeader *)targets[i].images));
+        targets[i].color_views = calloc(targets[i].count, sizeof *targets[i].color_views);
+        for (uint32_t j = 0; j < targets[i].count; j++) {
+            VkImageViewCreateInfo view = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = targets[i].images[j].image, .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = format,
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            if (vkCreateImageView(g_vk.dev, &view, NULL, &targets[i].color_views[j]) != VK_SUCCESS) {
+                LOG("[vr] could not create swapchain color view\n");
+                failed = true;
+                return;
+            }
+        }
     }
     LOG("[vr] session created, eyes %ux%u / %ux%u\n",targets[0].width,targets[0].height,targets[1].width,targets[1].height);
 }
@@ -585,6 +599,24 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
     vk_end_pass();
     VkCommandBuffer cb=vk_cmd();
     VkImage image=targets[i].images[idx].image;
+    if (src->format == VK_FORMAT_R8G8B8A8_UNORM || src->format == VK_FORMAT_B8G8R8A8_UNORM) {
+        VkImageMemoryBarrier color = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = image, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                             0, 0, NULL, 0, NULL, 1, &color);
+        vk_full_barrier(cb);
+        bool copied = vk_present_xr_scanout(cb, src, targets[i].color_views[idx], eye_format,
+                                           (VkExtent2D){targets[i].width, targets[i].height});
+        static bool color_reported;
+        if (copied && !color_reported) {
+            color_reported = true;
+            LOG("[vr-color] display-encoded UNORM scanout decoded before OpenXR transfer (VkFormat %d -> %d)\n", src->format, eye_format);
+        }
+        return copied;
+    }
     VkImageMemoryBarrier b={.sType=VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,.srcAccessMask=0,.dstAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT,
         .oldLayout=VK_IMAGE_LAYOUT_UNDEFINED,.newLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
         .srcQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.dstQueueFamilyIndex=VK_QUEUE_FAMILY_IGNORED,.image=image,
@@ -763,6 +795,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 g_debug_frame=false;
                 if(capture) interp_replay_report();
                 if(save_capture) {
+                    if (i == 0 && getenv("ODYSSEY_VR_COLOR_CHECK")) vk_vr_color_capture(vk_tex_replayed(texture));
                     char path[160];
                     if(check_samples>1) snprintf(path,sizeof path,"build/vr_rate_%llu_s%u_%c.png",(unsigned long long)renderer_present_count(),sample,i?'R':'L');
                     else if(count>1) snprintf(path,sizeof path,"build/vr_sequence_%llu_%c.png",(unsigned long long)renderer_present_count(),i?'R':'L');

@@ -100,6 +100,10 @@ typedef struct TexBackend {
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
 } TexBackend;
 
+bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView destination,
+                           VkFormat destination_format, VkExtent2D extent);
+void vk_vr_color_capture(TexBackend *source);
+
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 bool vk_deband(void);  // smooth gradients (textures.c "Banding"): the menu's setting, ODYSSEY_DEBAND=0|1 overrides it
 VkFormat vk_format(uint32_t nvn_format);

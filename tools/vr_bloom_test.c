@@ -4,6 +4,10 @@
 int main(void) {
     assert(vr_bloom_compose(3,false,3,0x3d,1600,900,0x3f,400,225,0x3f,1600,900));
     assert(vr_bloom_compose(3,false,3,0x3d,1440,810,0x3f,360,202,0x3f,1440,810));
+    assert(vr_bloom_compose(3,false,3,0x3d,1600,900,0x3f,400,228,0x3f,1600,900));
+    assert(vr_bloom_compose(3,false,3,0x3d,1440,810,0x3f,360,208,0x3f,1440,810));
+    assert(vr_bloom_compose(3,false,3,0x3d,1920,1080,0x3f,480,272,0x3f,1920,1080));
+    assert(!vr_bloom_compose(3,false,3,0x3d,1600,900,0x3f,400,240,0x3f,1600,900));
     assert(!vr_bloom_compose(6,false,3,0x3d,1600,900,0x3f,400,225,0x3f,1600,900));
     assert(!vr_bloom_compose(3,true,3,0x3d,1600,900,0x3f,400,225,0x3f,1600,900));
     assert(!vr_bloom_compose(3,false,1,0x3d,1600,900,0x3f,400,225,0x3f,1600,900));

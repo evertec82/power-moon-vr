@@ -36,18 +36,19 @@ def read_png(path):
     return w, h, bpp, rows
 
 
-for path in sys.argv[1:]:
-    w, h, bpp, rows = read_png(path)
-    step = max(1, (w * h) // 4000)  # (a sample of the pixels)
-    sums, sq, n, k = [0] * bpp, [0] * bpp, 0, 0
-    for y in range(h):
-        for x in range(w):
-            k += 1
-            if k % step: continue
-            for ch in range(bpp):
-                v = rows[y][x * bpp + ch]; sums[ch] += v; sq[ch] += v * v
-            n += 1
-    mean = [s / n for s in sums]
-    sd = [max(0.0, q / n - m * m) ** 0.5 for q, m in zip(sq, mean)]
-    print(f'{path.split("/")[-1]:16} {w:5}x{h:<4} mean ' + ' '.join(f'{m:5.1f}' for m in mean) +
-          '  sd ' + ' '.join(f'{s:5.1f}' for s in sd))
+if __name__ == '__main__':
+    for path in sys.argv[1:]:
+        w, h, bpp, rows = read_png(path)
+        step = max(1, (w * h) // 4000)  # (a sample of the pixels)
+        sums, sq, n, k = [0] * bpp, [0] * bpp, 0, 0
+        for y in range(h):
+            for x in range(w):
+                k += 1
+                if k % step: continue
+                for ch in range(bpp):
+                    v = rows[y][x * bpp + ch]; sums[ch] += v; sq[ch] += v * v
+                n += 1
+        mean = [s / n for s in sums]
+        sd = [max(0.0, q / n - m * m) ** 0.5 for q, m in zip(sq, mean)]
+        print(f'{path.split("/")[-1]:16} {w:5}x{h:<4} mean ' + ' '.join(f'{m:5.1f}' for m in mean) +
+              '  sd ' + ' '.join(f'{s:5.1f}' for s in sd))

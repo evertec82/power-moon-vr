@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.9
+
+- Fix washed-out headset colors when the game presents sRGB-encoded pixels in an RGBA8/BGRA8 UNORM image. Sample that scanout through an sRGB view and render into the OpenXR swapchain with the correct conversion. In-game GPU captures match the desktop reference exactly for an sRGB destination and within one 8-bit level for a linear destination.
+- Make the isolated NoBloom workaround the VR default, including direct executable launches. Recognize padded quarter-resolution bloom targets and use a clamp sampler for the black replacement texture. Headset confirmation of the returning moving-light artifact is pending.
+- Add an opt-in GPU color-transfer capture and comparison tool. Retain the canted-display, per-eye shadow, HUD, haptics and controller changes from previous releases.
+
 ## v0.2.8
 
 - Correct the screen-space shadow resolve's view-to-shadow lookup for each rendered eye instead of reconstructing both eyes with the center camera. Preserve the canted-display alignment introduced in v0.2.7.

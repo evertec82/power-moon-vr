@@ -4915,7 +4915,7 @@ static void draw_(CmdRec *r, bool indexed) {
         static int bloom_diag=-1;
         if(bloom_diag<0) {
             const char *e=getenv("ODYSSEY_VR_BLOOM_DIAG");
-            bloom_diag=e && !strcmp(e,"off");
+            bloom_diag=!e || !*e || !strcmp(e,"off");
         }
         // Replays can seed carry images from the native frame. Keep that frame
         // free of bloom too, or a partial/reused image can reintroduce the glow.
@@ -4928,6 +4928,11 @@ static void draw_(CmdRec *r, bool indexed) {
                 target->format,target->width,target->height,
                 bloom->format,bloom->width,bloom->height,scene->format,scene->width,scene->height)) {
                 fii[i].imageView=vk_dummy_view(TEXTYPE_2D);
+                // The black replacement has one mip and must stay black at
+                // every UV, including beyond the original bloom viewport.
+                fii[i].sampler=vk_default_sampler(true);
+                sc[0]=1.0f/bloom->width;
+                sc[1]=1.0f/bloom->height;
                 static struct { uint64_t hash; bool native; } seen[16];
                 static unsigned nseen;
                 bool native=vr_eye_index()<0;
@@ -5801,11 +5806,8 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     return v;
 }
 
-// Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
-void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
-    if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
-    VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
-    VkPipeline p = present_pipeline(g_vk.sc_format);
+static void present_sample(VkCommandBuffer cb, VkImageView src, VkFormat format, VkViewport vp, const float pv[8]) {
+    VkPipeline p = present_pipeline(format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
     VkWriteDescriptorSet w = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
@@ -5813,16 +5815,55 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
     vkUpdateDescriptorSets(g_vk.dev, 1, &w, 0, NULL);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
-    VkViewport vp = {vx, vy, vw, vh, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &vp);
     vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
     vkCmdDraw(cb, 3, 1, 0, 0);
+}
+
+// Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
+void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, float vw, float vh, const float pv[8]) {
+    if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
+    VkImageView src = post_process(cb, b, pv[6] > 0 ? vw / pv[6] : vw, pv[7] > 0 ? vh / pv[7] : vh);
+    present_sample(cb, src, g_vk.sc_format, (VkViewport){vx, vy, vw, vh, 0, 1}, pv);
     VkViewport full = {0, 0, (float)g_vk.sc_extent.width, (float)g_vk.sc_extent.height, 0, 1};
     vkCmdSetViewport(cb, 0, 1, &full);
 }
 
+bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView destination,
+                           VkFormat destination_format, VkExtent2D extent) {
+    // The game writes display-encoded bytes even when the scanout backing is
+    // UNORM. Decode through an sRGB view before filtering or writing to OpenXR.
+    VkFormat format;
+    switch (source->format) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB:
+        format = VK_FORMAT_R8G8B8A8_SRGB;
+        break;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB:
+        format = VK_FORMAT_B8G8R8A8_SRGB;
+        break;
+    default:
+        return false;
+    }
+    VkImageView view = vk_image_view(source, VK_IMAGE_VIEW_TYPE_2D, format, 0, 1, 0, 1,
+                                    (VkComponentMapping){0}, VK_IMAGE_ASPECT_COLOR_BIT);
+    if (!view) return false;
+    VkRenderingAttachmentInfo color = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+        .imageView = destination, .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        .loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
+    VkRenderingInfo rendering = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, extent},
+        .layerCount = 1, .colorAttachmentCount = 1, .pColorAttachments = &color};
+    vkCmdBeginRendering(cb, &rendering);
+    vkCmdSetScissor(cb, 0, 1, &rendering.renderArea);
+    const float params[8] = {0, 0, 0, 0, 0, 0, 1, 1};
+    present_sample(cb, view, destination_format, (VkViewport){0, 0, (float)extent.width, (float)extent.height, 0, 1}, params);
+    vkCmdEndRendering(cb);
+    ss_forget();
+    return true;
+}
+
+enum ScanoutCapture { CAPTURE_DESKTOP, CAPTURE_XR_SRGB, CAPTURE_LEGACY_BLIT, CAPTURE_XR_LINEAR };
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
-void renderer_save_texture_tex(TexBackend *b, const char *path) {
+static void save_texture_scanout(TexBackend *b, const char *path, enum ScanoutCapture transfer) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     extern const float *vk_shot_crop(void);
     float crop[4] = {0, 0, 1, 1};
@@ -5837,39 +5878,50 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vk_end_pass();
     VkImage img;
     VmaAllocation mem;
-    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = VK_FORMAT_R8G8B8A8_UNORM,
+    VkFormat capture_format = transfer == CAPTURE_XR_SRGB || transfer == CAPTURE_LEGACY_BLIT ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+    VkImageCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO, .imageType = VK_IMAGE_TYPE_2D, .format = capture_format,
                             .extent = {w, h, 1}, .mipLevels = 1, .arrayLayers = 1, .samples = VK_SAMPLE_COUNT_1_BIT,
-                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT};
+                            .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
     VmaAllocationCreateInfo ai = {.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE};
     VK_CHECK(vmaCreateImage(g_vk.vma, &ci, &ai, &img, &mem, NULL));
     VkCommandBuffer cb = vk_cmd();
     vk_full_barrier(cb);
     vk_image_init_layout(cb, img, VK_IMAGE_ASPECT_COLOR_BIT);
     VkImageViewCreateInfo vci = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = img, .viewType = VK_IMAGE_VIEW_TYPE_2D,
-                                 .format = VK_FORMAT_R8G8B8A8_UNORM, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+                                 .format = capture_format, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
     VkImageView tv;
     VK_CHECK(vkCreateImageView(g_vk.dev, &vci, NULL, &tv));
     VkRenderingAttachmentInfo ca = {.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO, .imageView = tv, .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
                                     .loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR, .storeOp = VK_ATTACHMENT_STORE_OP_STORE};
     VkRenderingInfo ri = {.sType = VK_STRUCTURE_TYPE_RENDERING_INFO, .renderArea = {{0, 0}, {w, h}}, .layerCount = 1,
                           .colorAttachmentCount = 1, .pColorAttachments = &ca};
-    vkCmdBeginRendering(cb, &ri);
-    VkPipeline p = present_pipeline(VK_FORMAT_R8G8B8A8_UNORM);
-    VkDescriptorSet ds = vk_alloc_set(present_set_layout);
-    VkDescriptorImageInfo ii = {vk_default_sampler(true), raw_view(b), VK_IMAGE_LAYOUT_GENERAL};
-    VkWriteDescriptorSet wr = {.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = 0, .descriptorCount = 1,
-                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .pImageInfo = &ii};
-    vkUpdateDescriptorSets(g_vk.dev, 1, &wr, 0, NULL);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
-    VkViewport vp = {0, 0, (float)w, (float)h, 0, 1};
-    VkRect2D sc = {{0, 0}, {w, h}};
-    vkCmdSetViewport(cb, 0, 1, &vp);
-    vkCmdSetScissor(cb, 0, 1, &sc);
-    float pv[8] = {renderer_origin_lower_left() && !strstr(path, "window") ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
-    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
-    vkCmdDraw(cb, 3, 1, 0, 0);
-    vkCmdEndRendering(cb);
+    if (transfer == CAPTURE_XR_SRGB || transfer == CAPTURE_XR_LINEAR) {
+        VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .oldLayout = VK_IMAGE_LAYOUT_GENERAL, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+            .image = img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        if (!vk_present_xr_scanout(cb, b, tv, capture_format, (VkExtent2D){w, h}))
+            FATAL("VR color check cannot sample scanout format %d\n", b->format);
+        barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+    } else if (transfer == CAPTURE_LEGACY_BLIT) {
+        VkImageBlit blit = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+            .srcOffsets = {{0, 0, 0}, {(int32_t)b->width, (int32_t)b->height, 1}},
+            .dstOffsets = {{0, 0, 0}, {(int32_t)w, (int32_t)h, 1}}};
+        vkCmdBlitImage(cb, b->image, VK_IMAGE_LAYOUT_GENERAL, img, VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    } else {
+        vkCmdBeginRendering(cb, &ri);
+        vkCmdSetScissor(cb, 0, 1, &ri.renderArea);
+        float pv[8] = {renderer_origin_lower_left() && !strstr(path, "window") ? 1.0f : 0.0f, 0, 0, 0, crop[0], crop[1], crop[2], crop[3]};
+        present_sample(cb, raw_view(b), capture_format, (VkViewport){0, 0, (float)w, (float)h, 0, 1}, pv);
+        vkCmdEndRendering(cb);
+    }
     vk_full_barrier(cb);
     VkSpan out = vk_readback((uint64_t)w * h * 4);
     VkBufferImageCopy c = {.bufferOffset = out.off, .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, .imageExtent = {w, h, 1}};
@@ -5878,6 +5930,19 @@ void renderer_save_texture_tex(TexBackend *b, const char *path) {
     vk_save_png(path, out.ptr, w, h);
     vkDestroyImageView(g_vk.dev, tv, NULL);
     vmaDestroyImage(g_vk.vma, img, mem);
+    ss_forget();
+}
+
+void renderer_save_texture_tex(TexBackend *b, const char *path) {
+    save_texture_scanout(b, path, CAPTURE_DESKTOP);
+}
+
+void vk_vr_color_capture(TexBackend *source) {
+    LOG("[vr-color-check] source VkFormat %d, %ux%u\n", source->format, source->width, source->height);
+    save_texture_scanout(source, "build/vr_color_reference.png", CAPTURE_DESKTOP);
+    save_texture_scanout(source, "build/vr_color_corrected.png", CAPTURE_XR_SRGB);
+    save_texture_scanout(source, "build/vr_color_legacy.png", CAPTURE_LEGACY_BLIT);
+    save_texture_scanout(source, "build/vr_color_linear.png", CAPTURE_XR_LINEAR);
 }
 
 // ================================================================== executor (renderer.m exec_list)
