@@ -2,6 +2,8 @@
 setlocal
 cd /d "%~dp0"
 set "ODYSSEY_VR=1"
+set "ODYSSEY_VR_NATIVE_DRAW=1"
+set "ODYSSEY_VR_CHECK_HZ="
 set "ODYSSEY_VR_UI_SCALE=0.65"
 set "ODYSSEY_VR_VIEW_BUTTON=sticks"
 set "ODYSSEY_VR_CONTROLLERS=1"
@@ -64,5 +66,5 @@ set "ODYSSEY_INPUT="
 set "ODYSSEY_SHOT_AT="
 set "ODYSSEY_SCREENSHOT_EVERY="
 set "ODYSSEY_EXIT_AFTER_SHOT="
-start "" /D "%~dp0" "%~dp0PowerMoonRecomp.exe"
+"%~dp0PowerMoonRecomp.exe" > "%~dp0PowerMoonRecomp.log" 2>&1
 endlocal

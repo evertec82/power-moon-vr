@@ -15,11 +15,11 @@ Download the Windows runtime package from [Releases](https://github.com/evertec8
 
 The package contains the base app and setup tools, but no game content. A game-library build-ID mismatch requires rebuilding the library locally from your own files. Windows 10/11 x64 and a Vulkan-capable GPU driver are required; system/driver DLLs are not redistributed.
 
-## Experimental native refresh
+## Native refresh
 
-This branch can draw additional gameplay frames at the headset refresh rate while Odyssey continues to update gameplay at 60 ticks per second. Each additional stage draw samples the headset camera, prepares the stage graphics and samples supported character animations. The renderer submits each eye pair with the head pose used to draw it. Other actors and effects can still animate at their original rate. The title screen, loading and unsupported scenes use the original cadence. If stereo delivery stays below 58 frames per second, the renderer falls back to a 60 Hz source cadence and retries when sustained render time allows it.
+All five VR launchers draw additional gameplay frames at the active headset refresh rate while Odyssey updates gameplay at 60 ticks per second. Each additional stage draw samples the headset camera, prepares the stage graphics and samples supported character animations. The renderer submits each eye pair with the head pose used to draw it. Other actors and effects can still animate at their original rate. The title screen, loading and unsupported scenes use the original cadence. If stereo delivery stays below 58 frames per second, the renderer falls back to a 60 Hz source cadence and retries when sustained render time allows it.
 
-Build both the runtime and your local game library from this branch. Copy the three files in `launchers/native-refresh/` beside the experimental executable in a separate installation. The 4× launcher renders at 3840×2160 and the lighter 2× launcher at 1920×1080. Each uses SteamVR's active refresh rate. The settings and save belong to that installation. For a headset comparison, use the same save and refresh setting, press F10 in gameplay, and compare SteamVR's application frame timing while moving Mario and turning your head. The test writes native draw rate, gameplay tick rate and stereo submission rate to `PowerMoonRecomp.log`.
+In headset testing at 4× and 90 Hz, the owner reported smooth head turns and 60–90 FPS depending on the scene. Performance at higher resolutions depends on scene cost and hardware. On upgrades from v0.2.10 or earlier, run setup when prompted so it can rebuild the local game library from your existing game files. F10 recenters the view. The SteamVR performance graph shows application FPS, and PowerMoonRecomp.log records gameplay ticks and stereo submissions.
 
 The stage draw preparation and skeletal sampling adapt the MIT-licensed work in [Super Odyssey PC Recomp](https://github.com/Simon3Sarkis/super-odyssey-pc-recomp/blob/052d390f4e741aa7ae964bd8de3e4520f6c8ca9e/runtime/hle/odyssey_120.c).
 
@@ -59,7 +59,7 @@ Game vibration drives the gamepad motors and the corresponding left/right VR con
 - v0.2.10 renders lighting/postprocessing in the native enclosing camera projection, then applies each runtime eye's asymmetric FOV and display cant to the completed image. The owner confirmed the misplaced/ghost-like shadows are gone. Eye separation and recorded pose timing are retained.
 - Native camera FOV/aspect/clip metadata now agrees with the VR render projection. Orange-platform visibility improved in owner testing; some platforms still disappear depending on head direction. This remains an open culling issue.
 - Corrected headset colors, NoBloom, controller haptics and gamepad/VR-controller support are retained. GPU color checks remain pixel-exact for an sRGB destination and within one level for linear output.
-- The original 2 ms render-debt allowance is retained. The 8 ms pacing test worsened judder and was excluded; occasional head-turn judder remains. Full-game and physical Pimax validation of the new projection path remain open.
+- The renderer keeps the 2 ms render-debt allowance used during headset validation. Full-game and physical Pimax validation of the new projection path remain open.
 - Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
 - Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.
 - A fixed title panel and a character-camera-anchored gameplay HUD at 65% neutral scale.

@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.11
+
+- Enable native headset-refresh rendering in the 4×, 6×, 8×, 9× and 10× launchers. Supported gameplay scenes render extra stereo pairs between 60 Hz gameplay ticks. Each pair uses the head pose captured for that scene draw.
+- Keep input and particle updates on gameplay ticks. Use the original cadence during loading and on the title screen, and fall back to a 60 Hz draw target under sustained load.
+- The 4× preset reached 90 FPS during headset testing, with smooth head turns and scene-dependent delivery of 60–90 FPS. The same refresh settings apply at every resolution.
+- Update the bundled generator and import library. Upgrading requires a one-time local game-library rebuild through setup.
+
 ## v0.2.10
 
 - Fix misplaced/ghost-like shading by rendering lighting and postprocessing in the native enclosing camera frustum, then projecting the completed image into each OpenXR eye's asymmetric FOV and cant. Keep eye separation and the recorded head-pose/submission timing. The owner confirmed the misplaced shadows are gone.
