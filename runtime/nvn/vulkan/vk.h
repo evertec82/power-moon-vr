@@ -101,7 +101,7 @@ typedef struct TexBackend {
 } TexBackend;
 
 bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView destination,
-                           VkFormat destination_format, VkExtent2D extent);
+                           VkFormat destination_format, VkExtent2D extent,const float *projection_warp);
 void vk_vr_color_capture(TexBackend *source);
 
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
@@ -141,3 +141,5 @@ void vk_vr_load_clear_scope(bool eligible);
 void vk_vr_load_clear_override(int value);
 bool vk_vr_take_load_clear(NvnTexture *t);
 bool vk_vr_load_clear_enabled(void);
+
+void vk_vr_projected_capture(TexBackend *source,const float *projection_warp,const char *path);

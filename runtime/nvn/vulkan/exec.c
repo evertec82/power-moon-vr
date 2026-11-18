@@ -668,7 +668,9 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
 }
 
 // Set per draw, before either shader stage uploads its uniform buffers.
-static bool vr_screen_reconstruction,vr_screen_shadow;
+static bool vr_screen_shadow, vr_geometry_pass;
+static NvnTexture *vr_screen_shadow_source;
+void vk_vr_screen_inputs_reset(void) { vr_screen_shadow_source = NULL; }
 
 // ================================================================== worker threads (shader / pipeline builds)
 // First-use compiles run off the render thread; draws needing them are skipped until ready (as on Metal).
@@ -1044,6 +1046,7 @@ void renderer_save_texture_tex(TexBackend *b, const char *path);
 static float pass_sx = 1, pass_sy = 1;
 static float vp_sx = 1, vp_sy = 1, vp_ox = 0, vp_oy = 0;
 static float tex_sc[2][64][2];
+static float tex_screen_uv[64][2];
 static uint32_t tex_wh[2][64][2];
 
 // ================================================================== render passes
@@ -3840,10 +3843,18 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // compared over the bytes the shader reads)
     uint64_t src = r.addr;
     if (g_interp_log && stage < 2) src = (uint64_t)(uintptr_t)interp_cbuf(stage, k, idx, (const void *)(uintptr_t)r.addr, size, si->cbuf_size[k]);
-    if(stage<2 && vr_screen_reconstruction && size>=64 && size<=65536) {
+    if(stage<2 && vr_screen_shadow && k==3 && r.size==608 && size==608) {
         extern unsigned vr_reconstruction_uniforms(float *,const float *,uint64_t,bool);
-        static float corrected[65536/sizeof(float)];
-        if(vr_reconstruction_uniforms(corrected,(const float *)(uintptr_t)src,size,vr_screen_shadow && k==3 && r.size==608))
+        float corrected[608/sizeof(float)];
+        if(vr_reconstruction_uniforms(corrected,(const float *)(uintptr_t)src,size,true))
+            return ubo_span(vk_transient_copy(corrected,size,256),size);
+    }
+    // Captured ambient-shadow atlas shader: native linear-depth rays feed
+    // CB4's inverse-view rows. Other CB4 consumers retain their own contracts.
+    if(stage==1 && k==4 && g_cur_fs_hash==0x2d7f01c86aca3c9eull && size>=384 && size<=4800) {
+        extern unsigned vr_ambient_reconstruction_uniforms(float *,const float *,uint64_t);
+        float corrected[4800/sizeof(float)];
+        if(vr_ambient_reconstruction_uniforms(corrected,(const float *)(uintptr_t)src,size))
             return ubo_span(vk_transient_copy(corrected,size,256),size);
     }
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
@@ -4355,7 +4366,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             bi[n] = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
-            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1]; }
+            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1];
+                if(sg==1){rs[1+t][2]=tex_screen_uv[t][0];rs[1+t][3]=tex_screen_uv[t][1];} }
             bi[n] = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
         } else {
             float zero[8] = {0};
@@ -4550,7 +4562,8 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
 }
 
 static void draw_(CmdRec *r, bool indexed) {
-    vr_screen_reconstruction=vr_screen_shadow=false;
+    vr_screen_shadow=false; vr_geometry_pass=false;
+    memset(tex_screen_uv,0,sizeof tex_screen_uv);
     float ui_scale=1;
     bool hud_panel=false;
     float hud_matrix[16];
@@ -4625,6 +4638,7 @@ static void draw_(CmdRec *r, bool indexed) {
         for (int i = 0; i < nskip_vs; i++) if (st.program->stages[0].code_addr == skip_vs[i]) { stat_skipped++; return; }
         if (g_debug_frame && getenv("ODYSSEY_LOG_FSHASH")) LOG("[fshash] fs=%llx hash %016llx\n", (unsigned long long)fs, (unsigned long long)last_hash);
         g_cur_fs_hash = last_hash;
+
     }
     if (g_interp_log) {  // (frame interpolation, runtime/nvn/interp.c: the draw's identity across frames)
         // the draw arguments (not the index buffer's address: dynamic geometry's buffers move every frame), the programs
@@ -4788,11 +4802,13 @@ static void draw_(CmdRec *r, bool indexed) {
             if(vr_depth_screen_pass(r->x[2],pr->vi->cbuf_mask,pr->vi->attr_mask,screen_source))
                 kind=VR_PASS_SCREEN;
             NvnTexture *target=st.rt.ncolor?st.rt.color[0]:NULL;
-            vr_screen_reconstruction=kind==VR_PASS_SCREEN && screen_source && target &&
+            bool reconstruction_pass=kind==VR_PASS_SCREEN && screen_source && target &&
                 target->width>=160 && target->height>=90 && target->width>target->height*1.70f && target->width<target->height*1.82f;
-            vr_screen_shadow=vr_screen_reconstruction && primary && renderer_format_is_depth(primary->format) &&
+            vr_screen_shadow=reconstruction_pass && primary && renderer_format_is_depth(primary->format) &&
                 pr->fi->ntex>=2 && pr->fi->tex[1].shadow;
+            if(vr_screen_shadow) vr_screen_shadow_source=target;
         }
+        vr_geometry_pass = kind==VR_PASS_WORLD;
         // Only actual layout elements on a screen-shaped canvas shrink.
         // Full-screen captures, fades and reconstruction passes keep their full viewport.
         NvnTexture *ui_target=st.rt.ncolor?st.rt.color[0]:NULL;
@@ -4946,6 +4962,15 @@ static void draw_(CmdRec *r, bool indexed) {
             }
         }
 
+        if(vr_geometry_pass && vr_screen_shadow_source &&
+           pr->fi->tex[i].type==TEXTYPE_2D && !pr->fi->tex[i].shadow &&
+           shader_texture_object(1,&pr->fi->tex[i])==vr_screen_shadow_source &&
+           wh[0] && wh[1] && sc[0]>0 && sc[1]>0) {
+            tex_screen_uv[i][0]=-1.0f/(wh[0]*sc[0]);
+            tex_screen_uv[i][1]=-1.0f/(wh[1]*sc[1]);
+            static bool reported;
+            if(!reported){reported=true;LOG("[vr-effects] forward screen lighting uses rasterized eye coordinates\n");}
+        }
         tex_sc[1][i][0] = sc[0]; tex_sc[1][i][1] = sc[1]; tex_wh[1][i][0] = wh[0]; tex_wh[1][i][1] = wh[1];
     }
     if (prof) prof_tex += SDL_GetTicksNS() - prof_tx_;
@@ -5187,6 +5212,10 @@ static void debug_draw(Prog *pr, CmdRec *r, bool indexed) {
     LOG("[draw]   depth range %g %g, poly mode %x offset enables %x (%g %g %g), attr0 %#x stride %u\n", st.depth_range[0][0],
         st.depth_range[0][1], st.poly[2], st.poly[3], st.poly_offset[0], st.poly_offset[1], st.poly_offset[2],
         st.nattrib ? st.attrib[0] : 0, st.nstream ? st.stream[0][0] : 0);
+    if (getenv("ODYSSEY_DEBUG_DATA")) {
+        for(int i=0;i<st.rt.ncolor;i++) if(st.rt.color[i])
+            LOG("[draw]   target%d %p\n",i,(void *)st.rt.color[i]);
+    }
     if (getenv("ODYSSEY_DEBUG_DATA")) {  // every attribute the vertex shader reads: NVN format / stream / offset
         LOG("[draw]   attribs:");
         for (int i = 0; i < 32; i++)
@@ -5571,7 +5600,7 @@ static VkPipeline present_pipeline(VkFormat fmt) {
         VkDescriptorSetLayoutBinding b = {0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, NULL};
         VkDescriptorSetLayoutCreateInfo li = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, .bindingCount = 1, .pBindings = &b};
         VK_CHECK(vkCreateDescriptorSetLayout(g_vk.dev, &li, NULL, &present_set_layout));
-        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT, 0, 32};
+        VkPushConstantRange r = {VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, 96};
         VkPipelineLayoutCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO, .setLayoutCount = 1,
                                          .pSetLayouts = &present_set_layout, .pushConstantRangeCount = 1, .pPushConstantRanges = &r};
         VK_CHECK(vkCreatePipelineLayout(g_vk.dev, &ci, NULL, &present_layout));
@@ -5806,7 +5835,7 @@ static VkImageView post_process(VkCommandBuffer cb, TexBackend *b, double ow_d, 
     return v;
 }
 
-static void present_sample(VkCommandBuffer cb, VkImageView src, VkFormat format, VkViewport vp, const float pv[8]) {
+static void present_sample_projected(VkCommandBuffer cb, VkImageView src, VkFormat format, VkViewport vp, const float pv[8],const float *warp) {
     VkPipeline p = present_pipeline(format);
     VkDescriptorSet ds = vk_alloc_set(present_set_layout);
     VkDescriptorImageInfo ii = {vk_default_sampler(true), src, VK_IMAGE_LAYOUT_GENERAL};
@@ -5816,8 +5845,13 @@ static void present_sample(VkCommandBuffer cb, VkImageView src, VkFormat format,
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, p);
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, present_layout, 0, 1, &ds, 0, NULL);
     vkCmdSetViewport(cb, 0, 1, &vp);
-    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, 32, pv);
+    float constants[24]={0};memcpy(constants,pv,8*sizeof(float));constants[1]=warp?1:0;
+    if(warp)memcpy(constants+8,warp,16*sizeof(float));
+    vkCmdPushConstants(cb, present_layout, VK_SHADER_STAGE_VERTEX_BIT|VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof constants, constants);
     vkCmdDraw(cb, 3, 1, 0, 0);
+}
+static void present_sample(VkCommandBuffer cb,VkImageView src,VkFormat format,VkViewport vp,const float pv[8]) {
+    present_sample_projected(cb,src,format,vp,pv,NULL);
 }
 
 // Inside the window image's rendering (device.c vk_frame_begin): the game image into (vx, vy, vw, vh).
@@ -5830,7 +5864,7 @@ void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float vx, float vy, floa
 }
 
 bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView destination,
-                           VkFormat destination_format, VkExtent2D extent) {
+                           VkFormat destination_format, VkExtent2D extent,const float *projection_warp) {
     // The game writes display-encoded bytes even when the scanout backing is
     // UNORM. Decode through an sRGB view before filtering or writing to OpenXR.
     VkFormat format;
@@ -5855,7 +5889,7 @@ bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView d
     vkCmdBeginRendering(cb, &rendering);
     vkCmdSetScissor(cb, 0, 1, &rendering.renderArea);
     const float params[8] = {0, 0, 0, 0, 0, 0, 1, 1};
-    present_sample(cb, view, destination_format, (VkViewport){0, 0, (float)extent.width, (float)extent.height, 0, 1}, params);
+    present_sample_projected(cb, view, destination_format, (VkViewport){0, 0, (float)extent.width, (float)extent.height, 0, 1}, params,projection_warp);
     vkCmdEndRendering(cb);
     ss_forget();
     return true;
@@ -5863,7 +5897,7 @@ bool vk_present_xr_scanout(VkCommandBuffer cb, TexBackend *source, VkImageView d
 
 enum ScanoutCapture { CAPTURE_DESKTOP, CAPTURE_XR_SRGB, CAPTURE_LEGACY_BLIT, CAPTURE_XR_LINEAR };
 // Screenshot of a game texture (presented crop applied to build/frame_* shots), via the present shader into RGBA8.
-static void save_texture_scanout(TexBackend *b, const char *path, enum ScanoutCapture transfer) {
+static void save_texture_scanout(TexBackend *b, const char *path, enum ScanoutCapture transfer,const float *projection_warp) {
     if (!b || !b->image || (b->aspect & ~VK_IMAGE_ASPECT_COLOR_BIT)) return;
     extern const float *vk_shot_crop(void);
     float crop[4] = {0, 0, 1, 1};
@@ -5902,7 +5936,7 @@ static void save_texture_scanout(TexBackend *b, const char *path, enum ScanoutCa
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
             .image = img, .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
-        if (!vk_present_xr_scanout(cb, b, tv, capture_format, (VkExtent2D){w, h}))
+        if (!vk_present_xr_scanout(cb, b, tv, capture_format, (VkExtent2D){w, h},projection_warp))
             FATAL("VR color check cannot sample scanout format %d\n", b->format);
         barrier.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -5934,15 +5968,18 @@ static void save_texture_scanout(TexBackend *b, const char *path, enum ScanoutCa
 }
 
 void renderer_save_texture_tex(TexBackend *b, const char *path) {
-    save_texture_scanout(b, path, CAPTURE_DESKTOP);
+    save_texture_scanout(b, path, CAPTURE_DESKTOP,NULL);
 }
 
+void vk_vr_projected_capture(TexBackend *source,const float *projection_warp,const char *path) {
+    save_texture_scanout(source,path,CAPTURE_XR_SRGB,projection_warp);
+}
 void vk_vr_color_capture(TexBackend *source) {
     LOG("[vr-color-check] source VkFormat %d, %ux%u\n", source->format, source->width, source->height);
-    save_texture_scanout(source, "build/vr_color_reference.png", CAPTURE_DESKTOP);
-    save_texture_scanout(source, "build/vr_color_corrected.png", CAPTURE_XR_SRGB);
-    save_texture_scanout(source, "build/vr_color_legacy.png", CAPTURE_LEGACY_BLIT);
-    save_texture_scanout(source, "build/vr_color_linear.png", CAPTURE_XR_LINEAR);
+    save_texture_scanout(source, "build/vr_color_reference.png", CAPTURE_DESKTOP,NULL);
+    save_texture_scanout(source, "build/vr_color_corrected.png", CAPTURE_XR_SRGB,NULL);
+    save_texture_scanout(source, "build/vr_color_legacy.png", CAPTURE_LEGACY_BLIT,NULL);
+    save_texture_scanout(source, "build/vr_color_linear.png", CAPTURE_XR_LINEAR,NULL);
 }
 
 // ================================================================== executor (renderer.m exec_list)

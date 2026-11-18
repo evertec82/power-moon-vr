@@ -42,15 +42,16 @@ The game starts in third person. VR reserves the stick-click buttons for view sw
 
 Touch-style controllers, Index, Microsoft motion controllers and simple-controller fallback have suggested bindings. Index uses A/B on each hand; Microsoft motion controllers use trackpad click for primary and right menu for secondary. SteamVR can rebind actions. Buttons combine with gamepad input; the stronger stick vector wins. VR input clears on focus loss or stale data.
 
-The gameplay HUD is anchored to the character camera. Isolated NoBloom is enabled by default in VR, including direct executable launches. `ODYSSEY_VR_BLOOM_DIAG=off` suppresses the identified HDR bloom input in native and stereo replay frames, including padded quarter-resolution variants. Set it to `on` to compare. The returning moving-light artifact still needs headset confirmation after this update.
+The gameplay HUD is anchored to the character camera. Isolated NoBloom is enabled by default in VR, including direct executable launches. `ODYSSEY_VR_BLOOM_DIAG=off` suppresses the identified HDR bloom input in native and stereo replay frames, including padded quarter-resolution variants. Set it to `on` to compare. The owner confirmed that the v0.2.10 native-projection path removes the misplaced shading.
 
 Game vibration drives the gamepad motors and the corresponding left/right VR controllers. **Controls → Vibration** controls both; **Test vibration** sends a short pulse to connected devices. Switch HD-rumble amplitudes are approximated on ordinary motors/OpenXR pulses, with bounded duration and stale-input expiry. Physical controller testing of VR haptics is pending.
 
 ## Current behavior
 
-- v0.2.9 corrects the OpenXR color transfer for display-encoded UNORM scanout images. The GPU color check matches the desktop reference pixel for pixel with an sRGB destination. Visual confirmation in a headset is pending.
-- v0.2.8 corrects per-eye reconstruction in the screen-space shadow resolve and matching depth-based effects. Both eyes use the camera mapping that produced their depth images; the existing bloom setting and pose timing are retained. Confirmation of the reported missing effects on physical headsets is still needed.
-- v0.2.7 addresses stereo alignment on canted-display headsets by preserving each OpenXR eye orientation and asymmetric FOV, using a centered head reference, and matching rendered/submitted views. The HUD uses the same per-eye optics. Synthetic regression and gameplay checks are provided; physical Pimax confirmation is still needed. The game's shared native culling frustum remains bounded for extremely wide peripheral views.
+- v0.2.10 renders lighting/postprocessing in the native enclosing camera projection, then applies each runtime eye's asymmetric FOV and display cant to the completed image. The owner confirmed the misplaced/ghost-like shadows are gone. Eye separation and recorded pose timing are retained.
+- Native camera FOV/aspect/clip metadata now agrees with the VR render projection. Orange-platform visibility improved in owner testing; some platforms still disappear depending on head direction. This remains an open culling issue.
+- Corrected headset colors, NoBloom, controller haptics and gamepad/VR-controller support are retained. GPU color checks remain pixel-exact for an sRGB destination and within one level for linear output.
+- The original 2 ms render-debt allowance is retained. The 8 ms pacing test worsened judder and was excluded; occasional head-turn judder remains. Full-game and physical Pimax validation of the new projection path remain open.
 - Stereo rendering with native camera head tracking, separate eye histories, and serial GPU retirement.
 - Gameplay compositor handoff before the GPU wait. The stationary main-menu panel waits for its image to complete, preserving button labels.
 - A fixed title panel and a character-camera-anchored gameplay HUD at 65% neutral scale.

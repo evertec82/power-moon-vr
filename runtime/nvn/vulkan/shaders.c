@@ -276,7 +276,12 @@ static const char *builtin_src(const char *name, int *stage) {
                "layout(set = 0, binding = 0) uniform sampler2D t;\n"
                "layout(location = 0) in vec2 uv;\n"
                "layout(location = 0) out vec4 o;\n"
-               "void main() { o = vec4(texture(t, uv).rgb, 1.0); }\n";
+               "layout(push_constant) uniform P { vec4 a; vec4 crop; mat4 warp; } pc;\n"
+               "void main() { vec2 u = uv;\n"
+               "  if(pc.a.y > 0.5) { vec4 p = pc.warp * vec4(uv.x*2.0-1.0, 1.0-uv.y*2.0, 0.0, 1.0);\n"
+               "    u = vec2(p.x, -p.y) / p.w * 0.5 + 0.5;\n"
+               "    if(p.w <= 0.0 || any(lessThan(u,vec2(0.0))) || any(greaterThan(u,vec2(1.0)))) { o=vec4(0,0,0,1); return; } }\n"
+               "  o = vec4(texture(t, u).rgb, 1.0); }\n";
     }
     // ---- post passes before the present (Video tab "Anti-aliasing" / "Upscaler"): exec.c vk_present_draw.
     // Each draws a fullscreen triangle into an image the size of its output; push constants: two vec4.

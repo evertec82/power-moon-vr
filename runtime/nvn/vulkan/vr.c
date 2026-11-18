@@ -1,3 +1,4 @@
+#include "vr_image_projection.h"
 // OpenXR stereo replay with native head camera, isolated eye history and headset-rate interpolation.
 // Game simulation stays at sixty steps per second.
 #define XR_NO_PROTOTYPES
@@ -535,6 +536,18 @@ static XrPosef rendered_eye_pose(int i) {
 }
 
 // Keep the projection shared by the depth and color passes. Per-draw uniform scans are unsafe.
+static bool native_frustum(void) {
+    static int on=-1;if(on<0){const char *e=getenv("ODYSSEY_VR_NATIVE_FRUSTUM");on=!e||atoi(e)!=0;}
+    return on && !late_geometry_test();
+}
+static bool vr_presentation_matrix(float out[16],int index) {
+    vr_identity(out);if(!native_frustum()||frame_title_menu)return false;
+    XrFovf f=views[index].fov;float q[16];
+    vr_eye_projection(q,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,1,100000);
+    q[10]=frame_projection[10];q[14]=frame_projection[14];
+    XrPosef local=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[index].pose),true,false);
+    return vr_image_projection(out,frame_projection,q,local.orientation);
+}
 static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool depth_minus_one,const void *uniforms,uint64_t bytes) {
     vr_identity(out);
     if(eye<0 || (offscreen_check && (!getenv("ODYSSEY_VR_CHECK_POSE") || (eye==0 && getenv("ODYSSEY_VR_CHECK_NEUTRAL_LEFT"))))) return;
@@ -553,8 +566,10 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
     vr_eye_projection(q,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,1,100000);
     // Match game's depth convention (including reverse Z) so its depth tests remain valid.
     q[10]=p[10]; q[14]=p[14];
+    if(native_frustum()) {memcpy(q,frame_projection,sizeof q);f=frame_fov;pose.orientation=(XrQuaternionf){0,0,0,1};}
     if(!world) {
         XrPosef delta=vr_replay_eye_delta(frame_head,tracking_head,relative_pose(views[eye].pose),true,late_geometry_test());
+        if(native_frustum())delta.orientation=(XrQuaternionf){0,0,0,1};
         vr_hud_eye_matrix(out,pose_compose(frame_head,delta),frame_fov,f,vr_ui_scale());
         return;
     }
@@ -568,8 +583,11 @@ static void vr_clip_matrix_uncached(float out[16],bool world,bool flip_y,bool de
 static float eye_clip_cache[2][2][16];
 static bool eye_clip_valid[2][2];
 static bool reconstruction_valid,reconstruction_ready;
-static float reconstruction_native[16],reconstruction_inv_native[16],reconstruction_eye[16],reconstruction_inv_eye[16],reconstruction_view[16];
-void vr_eye_replay_begin(void) { memset(eye_clip_valid,0,sizeof eye_clip_valid);reconstruction_valid=false; }
+static float reconstruction_inv_native[16],reconstruction_view[16];
+void vr_eye_replay_begin(void) {
+    extern void vk_vr_screen_inputs_reset(void);
+    vk_vr_screen_inputs_reset();memset(eye_clip_valid,0,sizeof eye_clip_valid);reconstruction_valid=false;
+}
 void vr_clip_matrix(float out[16],bool world,bool flip_y,bool depth_minus_one,const void *uniforms,uint64_t bytes) {
     if(eye<0 || frame_title_menu) { vr_identity(out); return; }
     if(!eye_clip_valid[world][flip_y]) {
@@ -580,17 +598,28 @@ void vr_clip_matrix(float out[16],bool world,bool flip_y,bool depth_minus_one,co
 }
 
 unsigned vr_reconstruction_uniforms(float *out,const float *in,uint64_t bytes,bool shadow) {
-    if(eye<0||frame_title_menu||bytes<64||bytes>65536)return 0;
+    if(!shadow||eye<0||frame_title_menu||bytes!=608)return 0;
     if(!reconstruction_valid){
         float clip[16];vr_clip_matrix(clip,true,false,false,NULL,0);
-        reconstruction_ready=vr_reconstruction_matrices(reconstruction_native,reconstruction_inv_native,
-            reconstruction_eye,reconstruction_inv_eye,reconstruction_view,frame_projection,clip);
+        reconstruction_ready=vr_shadow_view_correction(reconstruction_inv_native,reconstruction_view,frame_projection,clip);
         reconstruction_valid=true;
     }
     if(!reconstruction_ready)return 0;
-    unsigned n=vr_reconstruction_patch(out,in,bytes,shadow,reconstruction_native,reconstruction_inv_native,
-        reconstruction_eye,reconstruction_inv_eye,reconstruction_view);
-    if(n){static bool reported[2][2];if(!reported[eye][shadow]){reported[eye][shadow]=true;LOG("[vr-effects] eye %d %s camera correction active (%u matrices)\n",eye,shadow?"shadow resolve":"depth reconstruction",n);}}
+    unsigned n=vr_reconstruction_patch(out,in,bytes,shadow,reconstruction_inv_native,reconstruction_view);
+    if(n){static bool reported[2];if(!reported[eye]){reported[eye]=true;LOG("[vr-effects] eye %d shadow lookup correction active\n",eye);}}
+    return n;
+}
+
+unsigned vr_ambient_reconstruction_uniforms(float *out,const float *in,uint64_t bytes) {
+    if(eye<0||frame_title_menu||bytes<384||bytes>4800)return 0;
+    if(!reconstruction_valid){
+        float clip[16];vr_clip_matrix(clip,true,false,false,NULL,0);
+        reconstruction_ready=vr_shadow_view_correction(reconstruction_inv_native,reconstruction_view,frame_projection,clip);
+        reconstruction_valid=true;
+    }
+    if(!reconstruction_ready)return 0;
+    unsigned n=vr_ambient_reconstruction_patch(out,in,bytes,reconstruction_inv_native,reconstruction_view);
+    if(n){static bool reported[2];if(!reported[eye]){reported[eye]=true;LOG("[vr-effects] eye %d ambient-shadow world lookup correction active\n",eye);}}
     return n;
 }
 
@@ -599,7 +628,8 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
     vk_end_pass();
     VkCommandBuffer cb=vk_cmd();
     VkImage image=targets[i].images[idx].image;
-    if (src->format == VK_FORMAT_R8G8B8A8_UNORM || src->format == VK_FORMAT_B8G8R8A8_UNORM) {
+    if (src->format == VK_FORMAT_R8G8B8A8_UNORM || src->format == VK_FORMAT_B8G8R8A8_UNORM ||
+        (native_frustum() && (src->format == VK_FORMAT_R8G8B8A8_SRGB || src->format == VK_FORMAT_B8G8R8A8_SRGB))) {
         VkImageMemoryBarrier color = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED, .newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -608,8 +638,10 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
         vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                              0, 0, NULL, 0, NULL, 1, &color);
         vk_full_barrier(cb);
+        float projection_warp[16];bool warped=vr_presentation_matrix(projection_warp,i);
         bool copied = vk_present_xr_scanout(cb, src, targets[i].color_views[idx], eye_format,
-                                           (VkExtent2D){targets[i].width, targets[i].height});
+                                           (VkExtent2D){targets[i].width, targets[i].height},warped?projection_warp:NULL);
+        if(warped){static bool logged;if(!logged){logged=true;LOG("[vr-projection] native-frustum stereo; completed-image angular eye projection active\n");}}
         static bool color_reported;
         if (copied && !color_reported) {
             color_reported = true;
@@ -786,6 +818,9 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                         views[i].pose=pose_compose(head,(XrPosef){.orientation={0,i?-sinf(half):sinf(half),0,cosf(half)},.position={i?.032f:-.032f,0,0}});
                         views[i].fov=i?(XrFovf){-.67f,1.04f,.82f,-.71f}:(XrFovf){-1.04f,.67f,.79f,-.75f};
                     }
+                    // The synthetic headset must update the same native camera
+                    // target as real xrLocateViews, before the following game frame.
+                    if(native_frustum())update_camera_target();
                 }
                 extern bool g_debug_frame;
                 g_debug_frame=capture && i==1 && getenv("ODYSSEY_VR_CHECK_PASSES");
@@ -800,7 +835,9 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                     if(check_samples>1) snprintf(path,sizeof path,"build/vr_rate_%llu_s%u_%c.png",(unsigned long long)renderer_present_count(),sample,i?'R':'L');
                     else if(count>1) snprintf(path,sizeof path,"build/vr_sequence_%llu_%c.png",(unsigned long long)renderer_present_count(),i?'R':'L');
                     else snprintf(path,sizeof path,"build/vr_neutral_%s.png",i?"right":"left");
-                    renderer_save_texture_tex(vk_tex_replayed(texture),path);
+                    float projection_warp[16];
+                    if(vr_presentation_matrix(projection_warp,i))vk_vr_projected_capture(vk_tex_replayed(texture),projection_warp,path);
+                    else renderer_save_texture_tex(vk_tex_replayed(texture),path);
                 }
                 interp_replay_unlock();
             }
@@ -948,7 +985,11 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
             TexBackend *eye_image=vk_tex_replayed(texture);
             extern bool g_debug_frame;
             extern void renderer_save_texture_tex(TexBackend *b,const char *path);
-            if(capture_requested) renderer_save_texture_tex(eye_image,i?"build/vr_right.png":"build/vr_left.png");
+            if(capture_requested) {
+                float projection_warp[16];const char *path=i?"build/vr_right.png":"build/vr_left.png";
+                if(vr_presentation_matrix(projection_warp,i))vk_vr_projected_capture(eye_image,projection_warp,path);
+                else renderer_save_texture_tex(eye_image,path);
+            }
             static bool reported_size;
             if(!reported_size && eye_image) {
                 LOG("[vr] rendered eye source %ux%u; OpenXR swapchain %ux%u; pacing %s\n",eye_image->width,eye_image->height,targets[i].width,targets[i].height,high_rate?"display":"game");

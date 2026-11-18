@@ -613,6 +613,15 @@ static void glsl_sample(Ctx *c, char *out, int slot, const char *const *co, cons
         if (off && !cube) snprintf(xs, sizeof xs, "vec3(vec2(%s, %s) + vec2(%s) / vec2(tsize%d(%s).xy), %s)", co[0], co[1], off, slot, L, co[2]);
         else snprintf(xs, sizeof xs, "vec3(%s, %s, %s)", co[0], co[1], co[2]);  // cube lookups take no offset
     }
+    // VR can project geometry after its native screen-position varyings were
+    // generated. Screen-space lighting buffers must use the rasterized eye
+    // pixel, while ordinary material textures retain their original UVs.
+    if (c->stage == STAGE_FRAGMENT && type == TEXTYPE_2D && !t->shadow && !off) {
+        char original[1600]; snprintf(original, sizeof original, "%s", xs);
+        c->uses_rscale = true;
+        snprintf(xs, sizeof xs, "(rscale[%d].z < 0.0f ? gl_FragCoord.xy * (-rscale[%d].zw) : %s)",
+                 slot + 1, slot + 1, original);
+    }
     const char *extra = NULL;  // separate compare argument (cube array shadow)
     if (!t->shadow) {
         if (layer) snprintf(P, sizeof P, "vec%d(%s, float(%s))", n + 1, xs, layer);

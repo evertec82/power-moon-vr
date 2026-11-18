@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include "../runtime/nvn/vulkan/vr_image_projection.h"
 #include "../runtime/nvn/vulkan/vr_hud.h"
 static void near(float a,float b){assert(isfinite(a)&&isfinite(b)&&fabsf(a-b)<.0008f);}
 static void inverse_pose(float* m,XrPosef p){vr_pose_inverse(m,p.orientation.x,p.orientation.y,p.orientation.z,p.orientation.w,p.position.x,p.position.y,p.position.z);}
@@ -25,15 +26,29 @@ int main(void){
    float eye_v[16],delta_v[16],q[16],tmp[16],clip_delta[16],actual[16],expected[16];inverse_pose(eye_v,expected_eye);inverse_pose(delta_v,delta);XrFovf f=eyes[eye].fov;vr_eye_projection(q,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,.1f,10000);
    vr_multiply(tmp,delta_v,inv_p);vr_multiply(clip_delta,q,tmp);vr_multiply(actual,clip_delta,base_clip);vr_multiply(expected,q,eye_v);
    float submitted_v[16];inverse_pose(submitted_v,pose_relative(origin,submitted));for(int j=0;j<16;j++)near(submitted_v[j],eye_v[j]);
-   for(int depth=0;depth<3;depth++){float point[4]={.15f,-.08f,-(depth==0?.75f:depth==1?3.f:1000.f),1},a[2],b[2];project(a,actual,point);project(b,expected,point);near(a[0],b[0]);near(a[1],b[1]);cases++;}
+   float image_warp[16],source_v[16],source_clip[16],warped_expected[16];
+   XrPosef source_eye=expected_eye;source_eye.orientation=(late?head:recorded).orientation;
+   inverse_pose(source_v,source_eye);vr_multiply(source_clip,base_p,source_v);
+   assert(vr_image_projection(image_warp,base_p,q,local.orientation));
+   vr_multiply(warped_expected,image_warp,expected);
+   for(int y=-1;y<=1;y++)for(int x=-1;x<=1;x++) {
+    float edge[4]={x,y,0,1},uv[2];project(uv,image_warp,edge);
+    assert(fabsf(uv[0])<=1.0001f && fabsf(uv[1])<=1.0001f);
+   }
+   for(int depth=0;depth<3;depth++){float point[4]={.15f,-.08f,-(depth==0?.75f:depth==1?3.f:1000.f),1},a[2],b[2];project(a,actual,point);project(b,expected,point);near(a[0],b[0]);near(a[1],b[1]);
+    project(a,source_clip,point);project(b,warped_expected,point);near(a[0],b[0]);near(a[1],b[1]);cases++;}
    float hud[16];vr_hud_eye_matrix(hud,expected_eye,native,f,.65f);for(int j=0;j<16;j++)assert(isfinite(hud[j]));
    float hud_center[4]={0,0,0,1},panel_center[4]={0,0,-2,1},huv[2],puv[2],hud_p[16],hud_expected[16];
    vr_eye_projection(hud_p,f.angleLeft,f.angleRight,f.angleUp,f.angleDown,.01f,100);vr_multiply(hud_expected,hud_p,eye_v);
    project(huv,hud,hud_center);project(puv,hud_expected,panel_center);near(huv[0],puv[0]);near(huv[1],puv[1]);
+   float native_hud[16],inverse_warp[16],projected_hud[16];
+   vr_hud_eye_matrix(native_hud,source_eye,native,native,.65f);
+   assert(vr_inverse(inverse_warp,image_warp));vr_multiply(projected_hud,inverse_warp,native_hud);
+   project(huv,projected_hud,hud_center);near(huv[0],puv[0]);near(huv[1],puv[1]);
    // Frustum boundary rays map to the exact runtime eye's image edges.
    float ray[4]={tanf(f.angleLeft),tanf(f.angleDown),-1,0},ndc[2];project(ndc,q,ray);near(ndc[0],-1);near(ndc[1],-1);
    ray[0]=tanf(f.angleRight);ray[1]=tanf(f.angleUp);project(ndc,q,ray);near(ndc[0],1);near(ndc[1],1);
   }
  }
- puts("Canted/asymmetric stereo: centered head, signed quaternions, IPD, near/far projection, render/submission pose and HUD checks pass");printf("%u stereo point checks\n",cases);
+ puts("Canted/asymmetric stereo: centered head, signed quaternions, IPD, near/far projection, render/submission pose, completed-image projection, coverage and HUD checks pass");printf("%u stereo point checks\n",cases);
 }

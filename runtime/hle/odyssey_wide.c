@@ -66,7 +66,9 @@ float odyssey_wide_camera(void) {
             float aspect=camera[2]*g_want;
             extern bool vr_camera_target(float *,float *);
             float target_fovy,target_aspect;
+            bool headset_projection=false;
             if(vr_camera_target(&target_fovy,&target_aspect) && aspect>0) {
+                headset_projection=true;
                 fovy=target_fovy;
                 camera_aspect_factor=target_aspect/aspect;
                 aspect=target_aspect;
@@ -78,6 +80,17 @@ float odyssey_wide_camera(void) {
             if(vr_first_person_applied()) {
                 nearz=fminf(nearz,5.0f);
                 memcpy(&cpu->v[0],&nearz,sizeof nearz);
+            }
+            // Some visibility/LOD consumers read CameraPoseUpdater's scalar
+            // camera metadata rather than the already-overridden projection.
+            // Keep those values in agreement alongside the headset render projection.
+            static int metadata=-1;
+            if(metadata<0){const char *e=getenv("ODYSSEY_VR_CAMERA_METADATA");metadata=!e||atoi(e)!=0;}
+            if(metadata && headset_projection && isfinite(nearz) && isfinite(farz) && nearz>0 && farz>nearz) {
+                float synchronized[4]={nearz,farz,aspect/g_want,fovy*57.295779513f};
+                memcpy((void *)(uintptr_t)(cpu->x[19]+0xb8),synchronized,sizeof synchronized);
+                static bool reported;
+                if(!reported){reported=true;LOG("[vr-camera] metadata synchronized: stored FOV %.3f -> %.3f deg, aspect %.5f -> %.5f; near %.3f -> %.3f\n",camera[3],synchronized[3],camera[2],synchronized[2],camera[0],nearz);}
             }
             vr_game_projection(fovy,aspect,nearz,farz);
         }

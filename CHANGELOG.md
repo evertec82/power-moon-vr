@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.10
+
+- Fix misplaced/ghost-like shading by rendering lighting and postprocessing in the native enclosing camera frustum, then projecting the completed image into each OpenXR eye's asymmetric FOV and cant. Keep eye separation and the recorded head-pose/submission timing. The owner confirmed the misplaced shadows are gone.
+- Correct traced shadow and ambient-atlas lookups and forward screen-lighting coordinates without replacing unrelated effect matrices.
+- Synchronize native camera FOV/aspect/clip metadata with the VR projection. The owner reports improved orange-platform visibility, but some platforms still disappear with head direction; further culling investigation is deferred.
+- Make the confirmed settings default for the five 4x/6x/8x/9x/10x presets and direct VR-enabled launches. Preserve corrected colors, isolated NoBloom, stationary menu, camera-fixed HUD, haptics and VR-controller/gamepad support.
+- Keep the original 2 ms render-debt policy. The 8 ms pacing experiment worsened judder in headset testing and is not included in the defaults. Occasional head-turn judder remains.
+- Extend canted/asymmetric stereo, image-projection, angular-coverage and HUD regression checks. Offline gameplay replays report no draw/uniform misses; GPU color transfer remains exact for sRGB output and within one 8-bit level for linear output.
+
 ## v0.2.9
 
 - Fix washed-out headset colors when the game presents sRGB-encoded pixels in an RGBA8/BGRA8 UNORM image. Sample that scanout through an sRGB view and render into the OpenXR swapchain with the correct conversion. In-game GPU captures match the desktop reference exactly for an sRGB destination and within one 8-bit level for a linear destination.
