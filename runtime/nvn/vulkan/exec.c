@@ -3485,12 +3485,17 @@ typedef struct { NvnTexture *key; TexBackend copy; } Snap;
 static Snap snaps[16];
 static int nsnaps;
 
-static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
+static const NvnTexEntry *shader_texture_entry(int stage, const ShaderTexture *st_) {
     int slot = ((int)st_->handle_offset - 0x20) / 8;
     uint64_t h = (slot >= 0 && slot < 32) ? st.tex[stage][slot] : 0;
     uint32_t tic = h & 0xFFFFF;
     if (!h || !st.tpool || tic >= (uint32_t)st.tpool->count) return NULL;
-    return ((NvnTexEntry *)st.tpool->entries)[tic].tex;
+    return &((NvnTexEntry *)st.tpool->entries)[tic];
+}
+
+static NvnTexture *shader_texture_object(int stage, ShaderTexture *st_) {
+    const NvnTexEntry *entry = shader_texture_entry(stage, st_);
+    return entry ? entry->tex : NULL;
 }
 
 static bool is_attachment(NvnTexture *t) {
@@ -3742,11 +3747,14 @@ static void resolve_feedback(Prog *pr) {
     nfeedback = 0;
     static int off = -1;
     if (off < 0) off = getenv("ODYSSEY_NO_FEEDBACK") != NULL;
+    static int mip_views = -1;
+    if (mip_views < 0) mip_views = getenv("ODYSSEY_VK_FEEDBACK_MIPS") != NULL;
     if (off) return;
     ShaderInfo *infos[2] = {pr->vi, pr->fi};
     for (int sg = 0; sg < 2; sg++)
         for (int i = 0; i < infos[sg]->ntex; i++) {
-            NvnTexture *t = shader_texture_object(sg, &infos[sg]->tex[i]);
+            const NvnTexEntry *entry = shader_texture_entry(sg, &infos[sg]->tex[i]);
+            NvnTexture *t = entry ? entry->tex : NULL;
             if (!is_attachment(t)) continue;
             bool have = false;
             for (int k = 0; k < nfeedback; k++) have |= feedback_tex[k] == t;
@@ -3757,6 +3765,30 @@ static void resolve_feedback(Prog *pr) {
             for (int k = 0; k < 8; k++) if (snap_tex[k] == t) si = k;
             bool self_write = t == st.rt.depth && st.ds[0] && st.ds[1];
             TexBackend *src = vk_tex(t, true);
+            // As in Super Odyssey PC Recomp, a 2D reduction pass can use a
+            // sampled view that excludes the destination mip.
+            // Restrict the sampled view to those levels, which keep their LOD
+            // numbering. begin_pass already orders earlier attachment writes.
+            if (mip_views && st.rt.ncolor == 1 && st.rt.color[0] == t && st.rt.depth != t &&
+                src->base_type == VK_IMAGE_VIEW_TYPE_2D && infos[sg]->tex[i].type == TEXTYPE_2D &&
+                st.rt.has_cview[0] && (st.rt.cview[0].setmask & 1)) {
+                uint32_t target_level = st.rt.cview[0].base_level;
+                NvnTextureView view = entry->has_view ? entry->view : (NvnTextureView){0};
+                uint32_t base = (view.setmask & 1) ? view.base_level : 0;
+                if (base < target_level && target_level < src->levels) {
+                    uint32_t count = target_level - base;
+                    if ((view.setmask & 1) && view.num_levels && view.num_levels < count) count = view.num_levels;
+                    view.setmask |= 1;
+                    view.base_level = (uint16_t)base;
+                    view.num_levels = (uint16_t)count;
+                    VkImageView sampled = vk_view(t, &view, true, false, TEXTYPE_2D);
+                    if (sampled) {
+                        feedback_tex[nfeedback] = t;
+                        feedback_view[nfeedback++] = sampled;
+                        continue;
+                    }
+                }
+            }
             Snap *existing = NULL;
             for (int k = 0; k < nsnaps; k++) if (snaps[k].key == t && snaps[k].copy.image) existing = &snaps[k];
             VkImageAspectFlags sa = src->aspect & VK_IMAGE_ASPECT_DEPTH_BIT ? VK_IMAGE_ASPECT_DEPTH_BIT : src->aspect;
@@ -4664,7 +4696,7 @@ static void draw_(CmdRec *r, bool indexed) {
         // (a shadow pass for interp.c's light rule: a square depth-only target - not the scene's depth pre-pass, whose
         // camera block that rule took for a light's: snapped with a light while the colour pass blended, the pass's
         // depth-equal test failed - a parasol near the camera black in the in-betweens)
-        if (!interp_draw(hmix(hmix(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
+        if (!interp_draw(hash_words(hash_words(1469598103934665603ull, args, sizeof args), ids, sizeof ids), ids[3] != 0)) return;
     }
     // The draw record was consumed above, so skipping its GPU work preserves replay ordering.
     if(g_interp_replaying && !st.rt.ncolor && vk_vr_share_shadow(st.rt.depth)) {
@@ -4718,9 +4750,9 @@ static void draw_(CmdRec *r, bool indexed) {
     k.depth = pass_depth;
     k.stencil = pass_stencil;
     k.samples = pass_samples;
-    for (int i = 0; i < 32; i++) {
-        if (!(pr->vi->attr_mask & (1u << i))) continue;
-        k.attr_mask |= 1u << i;
+    k.attr_mask = pr->vi->attr_mask;
+    for (uint32_t remaining = k.attr_mask; remaining; remaining &= remaining - 1) {
+        int i = __builtin_ctz(remaining);
         uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
         uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
         if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
@@ -4736,8 +4768,8 @@ static void draw_(CmdRec *r, bool indexed) {
         k.attr_bind[i] = stream;
         k.used_streams |= 1u << stream;
     }
-    for (int s = 0; s < 16; s++) {
-        if (!(k.used_streams & (1u << s))) continue;
+    for (uint32_t remaining = k.used_streams & 0xffffu; remaining; remaining &= remaining - 1) {
+        int s = __builtin_ctz(remaining);
         k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
         k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
         if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
