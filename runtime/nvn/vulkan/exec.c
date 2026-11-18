@@ -1063,7 +1063,7 @@ static int debug_pass_no;
 // ODYSSEY_VK_STATE_FILTER=0: every draw sets everything, as before.
 enum { SS_PIPE = 1 << 0, SS_DT = 1 << 1, SS_DW = 1 << 2, SS_DOP = 1 << 3, SS_STEN = 1 << 4, SS_SFACE0 = 1 << 5, SS_SFACE1 = 1 << 6,
        SS_BC = 1 << 7, SS_CULL = 1 << 8, SS_FF = 1 << 9, SS_TOPO = 1 << 10, SS_PRE = 1 << 11, SS_DBE = 1 << 12, SS_DB = 1 << 13,
-       SS_VP = 1 << 14, SS_SC = 1 << 15, SS_IB = 1 << 16, SS_AK = 1 << 17 };
+       SS_VP = 1 << 14, SS_SC = 1 << 15, SS_IB = 1 << 16, SS_AK = 1 << 17, SS_EYE = 1 << 18 };
 static struct {
     uint32_t known;  // SS_* bits: the value below is what the command buffer has
     uint32_t vb_known;  // per vertex binding
@@ -1080,6 +1080,7 @@ static struct {
     VkBuffer ib; VkDeviceSize io; VkIndexType it;
     VkBuffer vb[17]; VkDeviceSize vo[17];
     uint32_t ak[4];  // vertex attribute kinds (push constant: translate.c vattr)
+    float eye_matrix[16];
 } ss;
 static int ss_on = -1;
 static void ss_forget(void) { ss.known = 0; ss.vb_known = 0; }
@@ -3842,7 +3843,12 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // (frame interpolation, runtime/nvn/interp.c: the frame's copy is logged; a replay binds the logged / blended one -
     // compared over the bytes the shader reads)
     uint64_t src = r.addr;
-    if (g_interp_log && stage < 2) src = (uint64_t)(uintptr_t)interp_cbuf(stage, k, idx, (const void *)(uintptr_t)r.addr, size, si->cbuf_size[k]);
+    if (stage == 0 && !g_interp_replaying) {
+        extern const void *odyssey_pose_render_palette(uint64_t, uint64_t);
+        const void *palette = odyssey_pose_render_palette(src, size);
+        if (palette) src = (uint64_t)(uintptr_t)palette;
+    }
+    if (g_interp_log && stage < 2) src = (uint64_t)(uintptr_t)interp_cbuf(stage, k, idx, (const void *)(uintptr_t)src, size, si->cbuf_size[k]);
     if(stage<2 && vr_screen_shadow && k==3 && r.size==608 && size==608) {
         extern unsigned vr_reconstruction_uniforms(float *,const float *,uint64_t,bool);
         float corrected[608/sizeof(float)];
@@ -4749,17 +4755,30 @@ static void draw_(CmdRec *r, bool indexed) {
     k.a2c = st.ms[0xC] != 0;
     k.topo_class = cls;
     k.poly_fill = st.poly[2] != 1;
-    uint64_t ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-    if (!ph) ph = 1;
-    uint32_t pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1), pprobes = 0;
-    while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph && ++pprobes < PIPE_TAB) pslot = (pslot + 1) & (PIPE_TAB - 1);
-    if (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) {
-        static int full;
-        if (!full++) LOG("[vk] pipeline table full (%d)\n", PIPE_TAB);
-        stat_skipped++;
-        return;
-    }
+    // The two eyes replay the same command records. Compare the complete key
+    // against the last lookup for this record before hashing ~700 bytes again.
+    // A hint stores a table index so that it cannot outlive a pipeline.
+    static uint16_t pipe_hints[8192];
+    uintptr_t record = (uintptr_t)r;
+    unsigned hint = ((record >> 5) ^ (record >> 17)) & 8191;
+    uint32_t pslot = pipe_hints[hint];
     Pipe *pp = pipe_tab[pslot].pipe;
+    uint64_t ph = 0;
+    if (!pp || memcmp(&pp->k, &k, sizeof k)) {
+        ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        if (!ph) ph = 1;
+        pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+        uint32_t probes = 0;
+        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph && ++probes < PIPE_TAB) pslot = (pslot + 1) & (PIPE_TAB - 1);
+        if (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) {
+            static int full;
+            if (!full++) LOG("[vk] pipeline table full (%d)\n", PIPE_TAB);
+            stat_skipped++;
+            return;
+        }
+        pipe_hints[hint] = (uint16_t)pslot;
+        pp = pipe_tab[pslot].pipe;
+    }
     if (!pp) {
         pp = calloc(1, sizeof *pp);
         pp->k = k;
@@ -4813,10 +4832,10 @@ static void draw_(CmdRec *r, bool indexed) {
         // Full-screen captures, fades and reconstruction passes keep their full viewport.
         NvnTexture *ui_target=st.rt.ncolor?st.rt.color[0]:NULL;
         uint64_t ui_bytes=st.ubuf[0][0].size;
-        const float *ui_uniforms=interp_cbuf_peek(0,0,(const void *)(uintptr_t)st.ubuf[0][0].addr,&ui_bytes);
+        bool text_shader=!st.ds[0] && (pr->vi->cbuf_mask&8) && pr->vi->cbuf_size[3]==256;
+        const float *ui_uniforms=text_shader?interp_cbuf_peek(0,0,(const void *)(uintptr_t)st.ubuf[0][0].addr,&ui_bytes):NULL;
         // Font glyphs use a combined layout view/projection in a compact 128-byte buffer.
-        bool layout_text=!st.ds[0] && (pr->vi->cbuf_mask&8) && pr->vi->cbuf_size[3]==256 &&
-            ui_uniforms && ui_bytes==128 && ui_uniforms[0]>0 && ui_uniforms[2]==0 && ui_uniforms[6]==0 &&
+        bool layout_text=ui_uniforms && ui_bytes==128 && ui_uniforms[0]>0 && ui_uniforms[2]==0 && ui_uniforms[6]==0 &&
             ui_uniforms[12]==0 && ui_uniforms[13]==0 && ui_uniforms[14]==-1 && ui_uniforms[15]>0;
         if((kind==VR_PASS_HUD || layout_text) && ui_target && ui_target->width>=640 && ui_target->height>=360 &&
            ui_target->width>1.70f*ui_target->height && ui_target->width<1.82f*ui_target->height &&
@@ -4831,7 +4850,10 @@ static void draw_(CmdRec *r, bool indexed) {
                            (const void *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size);
         if(hud_panel)memcpy(hud_matrix,eye_matrix,sizeof hud_matrix);
         }
-        vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 16, sizeof eye_matrix, eye_matrix);
+        if (ss_need(SS_EYE, !memcmp(ss.eye_matrix,eye_matrix,sizeof eye_matrix))) {
+            memcpy(ss.eye_matrix,eye_matrix,sizeof eye_matrix);
+            vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 16, sizeof eye_matrix, eye_matrix);
+        }
     }
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;

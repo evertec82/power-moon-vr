@@ -23,6 +23,7 @@
 #include "vr_reconstruction.h"
 #include "vr_first_person.h"
 #include "../../cpu.h"
+#include "../../odyssey_native_draw.h"
 #include "../renderer.h"
 extern uint64_t renderer_fence_seq(void);
 extern void renderer_submit(void);
@@ -61,6 +62,24 @@ static VkFormat eye_format;
 static uint64_t frame_count;
 static VrRateClock refresh_clock;
 static _Atomic int64_t display_period_ns;
+static PFN_xrGetDisplayRefreshRateFB get_display_refresh;
+static _Atomic unsigned physical_hz, observed_hz;
+static _Atomic bool draw_visible;
+
+static unsigned rounded_hz(float hz) {
+    return isfinite(hz) && hz >= 59 && hz <= 240.5f ? (unsigned)lroundf(hz) : 0;
+}
+unsigned vr_native_display_hz(void) {
+    if (offscreen_check) {
+        const char *test = getenv("ODYSSEY_VR_CHECK_HZ");
+        unsigned hz = test ? rounded_hz(strtof(test, NULL)) : 0;
+        return hz > 60 ? hz : 60;
+    }
+    if (!atomic_load(&draw_visible)) return 60;
+    unsigned hz = atomic_load(&physical_hz);
+    if (!hz) hz = atomic_load(&observed_hz);
+    return hz > 60 ? hz : 60;
+}
 static _Atomic float measured_vr_fps,target_vr_hz;
 static bool multiple_samples,previous_camera_valid;
 static _Atomic bool pose_queries_active;
@@ -144,6 +163,8 @@ bool vr_simulation_enabled(void) {
 }
 uint64_t vr_simulation_deadline(uint64_t now) {
     static VrSimulationClock clock;
+    uint64_t native = odyssey_native_present_deadline();
+    if (native) return native;
     return vr_simulation_step(&clock,now);
 }
 bool vr_multiple_samples(void) { return multiple_samples; }
@@ -225,7 +246,10 @@ static XrPosef native_head={.orientation={0,0,0,1}};
 static XrPosef applied_head={.orientation={0,0,0,1}};
 static XrPosef frame_head={.orientation={0,0,0,1}};
 static XrPosef tracking_head={.orientation={0,0,0,1}};
-typedef struct { float *key,base[21],last[21]; bool used; } CameraBase;
+typedef struct { float *key,base[21],last[21],render_base[21]; bool used; } CameraBase;
+static bool has_draw_pose;
+static XrPosef draw_pose;
+static int64_t draw_pose_time;
 static bool query_native_head(XrPosef *head,int64_t *pose_time) {
     if(!native_pose_query_enabled()||offscreen_check||!atomic_load(&pose_queries_active))return false;
     uint64_t now=SDL_GetTicksNS();int64_t target;XrPosef anchor;
@@ -296,10 +320,45 @@ void vr_apply_game_camera(float *fields) {
     memcpy(fields,out,sizeof out);
     pthread_mutex_lock(&camera_lock);
     applied_head=h;applied_pose_time=queried_time;
-    if(entry) { memcpy(entry->base,original_base,sizeof original_base); memcpy(entry->last,fields,sizeof base); entry->used=true; }
+    if(entry) { memcpy(entry->base,original_base,sizeof original_base); memcpy(entry->last,fields,sizeof base);
+        memcpy(entry->render_base,base,sizeof base);entry->used=true; }
     pthread_mutex_unlock(&camera_lock);
     static bool logged;
     if(!logged) { logged=true; LOG("[vr] native LookAtCamera head tracking active\n"); }
+}
+void vr_native_draw_begin(void) {
+    pthread_mutex_lock(&camera_lock);
+    has_draw_pose = false;
+    pthread_mutex_unlock(&camera_lock);
+}
+// Refresh the source camera before the stage prepares lighting and draws. Only
+// an exact match to the last tracked native camera can be safely rebased. The
+// caller restores the live game's camera after recording the complete draw.
+bool vr_resample_draw_camera(float *fields) {
+    float base[21], result[21];
+    XrPosef head;
+    bool matched = false;
+    pthread_mutex_lock(&camera_lock);
+    for (unsigned i = 0; i < sizeof camera_base / sizeof camera_base[0]; ++i) {
+        CameraBase *entry = &camera_base[i];
+        if (entry->used && entry->key == fields && !memcmp(entry->last, fields, sizeof base)) {
+            memcpy(base, entry->render_base, sizeof base);
+            matched = true;
+            break;
+        }
+    }
+    head = native_head;
+    pthread_mutex_unlock(&camera_lock);
+    int64_t stamp = 0;
+    if (!matched || (!offscreen_check && !query_native_head(&head, &stamp)) ||
+        !vr_lookat_head(result, base, head, scale)) return false;
+    memcpy(fields, result, sizeof result);
+    pthread_mutex_lock(&camera_lock);
+    draw_pose = head;
+    draw_pose_time = stamp;
+    has_draw_pose = true;
+    pthread_mutex_unlock(&camera_lock);
+    return true;
 }
 bool vr_camera_target(float *fovy,float *aspect) {
     if(!vr_enabled() || atomic_load_explicit(&title_menu_active,memory_order_relaxed)) return false;
@@ -326,26 +385,45 @@ void vr_game_projection(float fovy,float aspect,float nearz,float farz) {
 }
 static VrCameraState queued_camera;
 static bool have_queued_camera;
-void vr_camera_snapshot(VrCameraState *out) {
+static VrCameraState stage_camera;
+static bool stage_camera_ready;
+static void read_camera_locked(VrCameraState *out) {
     memset(out,0,sizeof *out);
-    pthread_mutex_lock(&camera_lock);
     out->valid=game_camera.valid;
     out->title_menu=atomic_load_explicit(&title_menu_active,memory_order_relaxed);
     out->fovy=game_camera.fovy; out->aspect=game_camera.aspect;
     out->nearz=game_camera.nearz; out->farz=game_camera.farz;
-    out->pose_time=applied_pose_time;
-    memcpy(out->orientation,&applied_head.orientation,sizeof out->orientation);
-    memcpy(out->position,&applied_head.position,sizeof out->position);
+    out->draw_only=odyssey_skip_extra_particle_update();
+    out->has_draw_pose=has_draw_pose;
+    out->desired_hz=odyssey_native_requested_hz();
+    out->pose_time=has_draw_pose?draw_pose_time:applied_pose_time;
+    XrPosef h=has_draw_pose?draw_pose:applied_head;
+    memcpy(out->orientation,&h.orientation,sizeof out->orientation);
+    memcpy(out->position,&h.position,sizeof out->position);
+}
+// The following framework calculation may start before NVN presents this
+// scene. Keep the image's pose with its draw, including on a draw-only slot.
+void vr_record_stage_camera(void) {
+    pthread_mutex_lock(&camera_lock);
+    read_camera_locked(&stage_camera);
+    stage_camera_ready=true;
+    pthread_mutex_unlock(&camera_lock);
+}
+void vr_camera_snapshot(VrCameraState *out) {
+    pthread_mutex_lock(&camera_lock);
+    if (stage_camera_ready) {
+        *out=stage_camera;
+        stage_camera_ready=false;
+    } else {
+        read_camera_locked(out);
+        out->draw_only=false;
+    }
     pthread_mutex_unlock(&camera_lock);
 }
 void vr_camera_queued(const VrCameraState *state) {
     queued_camera=*state; have_queued_camera=true;
 }
-static void freeze_projection(void) {
-    extern bool rq_on_thread(void);
-    VrCameraState state;
-    if(rq_on_thread() && have_queued_camera) state=queued_camera;
-    else vr_camera_snapshot(&state);
+static void freeze_projection(VrCameraState state) {
     frame_title_menu=state.title_menu;
     frame_pose_time=state.pose_time;
     pthread_mutex_lock(&camera_lock);
@@ -408,12 +486,32 @@ void vr_bootstrap(void) {
     getproc = (PFN_xrGetInstanceProcAddr)SDL_LoadFunction(loader,"xrGetInstanceProcAddr");
     if (!getproc) { LOG("[vr] OpenXR loader has no xrGetInstanceProcAddr\n"); return; }
     XR_TRY(getproc(XR_NULL_HANDLE,"xrCreateInstance",(PFN_xrVoidFunction *)&pCreateInstance));
-    const char *ext[] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
+    const char *ext[2] = {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME};
     XrInstanceCreateInfo ci = {.type=XR_TYPE_INSTANCE_CREATE_INFO, .enabledExtensionCount=1, .enabledExtensionNames=ext};
+    const char *native_draw = getenv("ODYSSEY_VR_NATIVE_DRAW");
+    if (native_draw && atoi(native_draw)) {
+        PFN_xrEnumerateInstanceExtensionProperties extensions = NULL;
+        uint32_t n = 0;
+        if (XR_SUCCEEDED(getproc(XR_NULL_HANDLE,"xrEnumerateInstanceExtensionProperties",(PFN_xrVoidFunction *)&extensions)) &&
+            extensions && XR_SUCCEEDED(extensions(NULL,0,&n,NULL)) && n) {
+            XrExtensionProperties *list = calloc(n, sizeof *list);
+            if (list) {
+                for (uint32_t i=0; i<n; ++i) list[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+                if (XR_SUCCEEDED(extensions(NULL,n,&n,list))) for (uint32_t i=0; i<n; ++i)
+                    if (!strcmp(list[i].extensionName,XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME)) {
+                        ext[ci.enabledExtensionCount++] = XR_FB_DISPLAY_REFRESH_RATE_EXTENSION_NAME;
+                        break;
+                    }
+                free(list);
+            }
+        }
+    }
     strcpy(ci.applicationInfo.applicationName,"Power Moon VR experimental");
     strcpy(ci.applicationInfo.engineName,"PowerMoonRecomp");
     ci.applicationInfo.apiVersion=XR_MAKE_VERSION(1,0,0);
     XR_TRY(pCreateInstance(&ci,&instance));
+    if (ci.enabledExtensionCount > 1)
+        getproc(instance,"xrGetDisplayRefreshRateFB",(PFN_xrVoidFunction *)&get_display_refresh);
 #define LOAD(n) XR_TRY(getproc(instance,"xr" #n,(PFN_xrVoidFunction *)&p##n));
     XR_FUNCS(LOAD)
 #undef LOAD
@@ -516,12 +614,22 @@ static void poll_events(void) {
             XrSessionState s=((XrEventDataSessionStateChanged *)&event)->state;
             LOG("[vr] session state %d\n",s);
             focused=s==XR_SESSION_STATE_FOCUSED;
+            if (s!=XR_SESSION_STATE_VISIBLE && !focused) atomic_store(&draw_visible,false);
             if(!focused)vr_input_clear();else vr_input_profiles(session);
             if(s==XR_SESSION_STATE_READY) {
                 XrSessionBeginInfo bi={.type=XR_TYPE_SESSION_BEGIN_INFO,.primaryViewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO};
-                if(xr_ok(pBeginSession(session,&bi),"begin session")){running=true;atomic_store(&pose_queries_active,true);}
+                if(xr_ok(pBeginSession(session,&bi),"begin session")){
+                    running=true;atomic_store(&pose_queries_active,true);
+                    atomic_store(&observed_hz,0);
+                    float hz=0;
+                    atomic_store(&physical_hz,get_display_refresh && XR_SUCCEEDED(get_display_refresh(session,&hz)) ? rounded_hz(hz) : 0);
+                    if(atomic_load(&physical_hz))LOG("[native-draw] headset refresh %.2f Hz\n",hz);
+                }
             } else if(s==XR_SESSION_STATE_STOPPING) { atomic_store(&pose_queries_active,false); running=false; xr_ok(pEndSession(session),"end session"); }
             else if(s==XR_SESSION_STATE_EXITING||s==XR_SESSION_STATE_LOSS_PENDING) { atomic_store(&pose_queries_active,false); running=false; failed=true; }
+        } else if(event.type==XR_TYPE_EVENT_DATA_DISPLAY_REFRESH_RATE_CHANGED_FB) {
+            XrEventDataDisplayRefreshRateChangedFB *change=(void *)&event;
+            atomic_store(&physical_hz,rounded_hz(change->toDisplayRefreshRate));
         } else if(event.type==XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {vr_input_profiles(session);
         } else if(event.type==XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) { running=false; failed=true; }
         else if(event.type==XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {pthread_mutex_lock(&camera_lock);centered=false;last_native_query_time=0;applied_pose_time=0;pthread_mutex_unlock(&camera_lock);}
@@ -672,7 +780,20 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     static unsigned consecutive_skips;
     static uint64_t skipped;
     bool simulation=vr_simulation_enabled();
-    rate_stats(true,false,false);
+    extern bool rq_on_thread(void);
+    VrCameraState local_camera;
+    const VrCameraState *source_camera = &queued_camera;
+    if (!rq_on_thread() || !have_queued_camera) { vr_camera_snapshot(&local_camera); source_camera = &local_camera; }
+    bool only_draw = source_camera->draw_only;
+    unsigned desired = source_camera->desired_hz;
+    if (desired && offscreen_check) {
+        extern uint64_t renderer_present_count(void);
+        const char *bench = getenv("ODYSSEY_VR_BENCH_START");
+        if (!bench || renderer_present_count() < strtoull(bench,NULL,10)) desired = 0;
+        else atomic_store(&target_vr_hz, (float)vr_native_display_hz());
+    }
+    uint64_t begin_work = desired ? SDL_GetTicksNS() : 0, runtime_wait = 0;
+    rate_stats(!only_draw,false,false);
     if(simulation) {
         static uint64_t debt_budget;
         if(!debt_budget) {
@@ -685,12 +806,14 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         bool late=vr_simulation_late_budget(plat_now_ns(),deadline,debt_budget);
         // Keep servicing OpenXR during sustained overload. A skipped visual frame
         // stays with the compositor under its original submitted projection pose.
-        if(late && consecutive_skips<6 && !capture_requested) {
+        bool missing_pose = only_draw && !source_camera->has_draw_pose;
+        if(missing_pose || (late && consecutive_skips<6 && !capture_requested)) {
             consecutive_skips++; skipped++;
             interp_frame_drop(frame);
             previous_camera_valid=false; previous_head_motion=false;
             if(eye_history_active) { extern void vk_vr_history_reset(void); vk_vr_history_reset(); }
             eye_history_active=false;
+            if (desired) odyssey_native_delivery(desired,false,only_draw,0);
             if(skipped%60==1) LOG("[vr-sim] skipped %llu stereo frames to catch up simulation\n",(unsigned long long)skipped);
             return true;
         }
@@ -705,7 +828,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         }
     }
     bool completed=false;
-    freeze_projection();
+    freeze_projection(*source_camera);
     static bool previous_title_menu;
     if(previous_title_menu!=frame_title_menu) {
         extern void vk_vr_history_reset(void);
@@ -718,6 +841,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     const char *sample_env=getenv("ODYSSEY_VR_CHECK_SAMPLES");
     if(offscreen_check && sample_env && atoi(sample_env)>1) check_samples=(unsigned)atoi(sample_env);
     if(check_samples>4) check_samples=4;
+    bool keep_history = !serial_high_rate() && (rate_requested() || check_samples > 1);
     bool high_rate=rate_requested() && !offscreen_check && (!simulation || serial_high_rate()) && !frame_title_menu;
     multiple_samples=high_rate || check_samples>1;
     bool blend=false;
@@ -731,7 +855,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         blend=interp_frame_begin(frame);
         cost_add(C_MATCH,match_at);
         if(!interp_replay_ready()) goto done;
-    } else if(!interp_frame_current(frame)) goto done;
+    } else if(!interp_frame_current(frame,keep_history)) goto done;
     if(!previous_camera_valid) blend=false;
     for(int i=0;i<16;i++)
         if(fabsf(frame_projection[i]-previous_projection[i])>.0001f) blend=false;
@@ -780,6 +904,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 vk_vr_shadow_override(-1); vk_vr_load_clear_override(-1); multiple_samples=saved_multiple;
                 LOG("[vr-check] same-frame %s A/B capture complete\n",compare_clear?"clear":"shadow");
             }
+            bool all_eyes = true;
             for(unsigned sample=0;sample<check_samples;sample++) {
                 float alpha=(sample+.5f)/check_samples;
                 bool prepared=check_samples>1 && blend && interp_prepare(alpha);
@@ -787,6 +912,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 frame_head=prepared?vr_pose_blend(previous_head,simulation_head,alpha):simulation_head;
                 if(capture && check_samples>1) LOG("[vr-check] sample %u/%u alpha %.3f blended %d\n",sample+1,check_samples,alpha,prepared);
             int check_eyes=frame_title_menu && getenv("ODYSSEY_VR_CHECK_TITLE_LIVE")?1:2;
+            int rendered_eyes=0;
             for(int order=0;order<check_eyes;order++) if(interp_replay_lock()) {
                 int i=getenv("ODYSSEY_VR_CHECK_REVERSE")?1-order:order;
                 eye=i; g_interp_replay_epoch=epoch;
@@ -826,6 +952,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 g_debug_frame=capture && i==1 && getenv("ODYSSEY_VR_CHECK_PASSES");
                 uint64_t replay_at=SDL_GetTicksNS();
                 renderer_interp_replay();
+                if (vk_tex_replayed(texture)) ++rendered_eyes;
                 bench_cpu+=SDL_GetTicksNS()-replay_at;
                 g_debug_frame=false;
                 if(capture) interp_replay_report();
@@ -841,6 +968,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 }
                 interp_replay_unlock();
             }
+            all_eyes &= rendered_eyes == check_eyes;
             }
             if(bench_env) {
                 vk_wait_seq(vk_pending_seq()-1);
@@ -859,12 +987,12 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                                 vr_metrics_percentile(&v->times,95),v->times.longest/1e6);
                         }
                     }
-                    rate_stats(false,true,false);
+                    rate_stats(false,all_eyes,false);
                     if(n%120==0 || capture) LOG("[vr-bench] %llu pairs: translate %.3f ms/pair; complete %.3f ms/pair\n",(unsigned long long)n,cpu/(double)n/1e6,total/(double)n/1e6);
                 }
             }
             if(bench_variant>=0)vk_vr_load_clear_override(-1);
-            completed=true;
+            completed=all_eyes;
             if(capture) {
                 LOG("[vr-check] captured sequence frame %llu; title panel %d; first person requested %d applied %d\n",(unsigned long long)renderer_present_count(),frame_title_menu,vr_first_person_requested(),vr_first_person_applied());
                 extern uint64_t vk_vr_folded_clear_count(void);
@@ -893,6 +1021,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     XrFrameState fs={.type=XR_TYPE_FRAME_STATE};
     uint64_t wait_at=SDL_GetTicksNS();
     if(!xr_ok(pWaitFrame(session,&wi,&fs),"wait frame")) goto done;
+    if (desired) runtime_wait += SDL_GetTicksNS() - wait_at;
     cost_add(C_XRWAIT,wait_at);
     pthread_mutex_lock(&camera_lock);
     pose_prediction_time=fs.predictedDisplayTime;pose_prediction_host=SDL_GetTicksNS();
@@ -902,9 +1031,16 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     last_predicted=fs.predictedDisplayTime;
     if(headset_samples)extra_images++;
     int64_t period=fs.predictedDisplayPeriod;
+    atomic_store(&draw_visible,fs.shouldRender && running && !failed);
     if(period>0) {
         atomic_store(&display_period_ns,period);
-        atomic_store(&target_vr_hz,(float)(1e9/period));
+        unsigned observed=rounded_hz((float)(1e9/period));
+        // Without the refresh extension, a longer application interval can be
+        // compositor throttling. Retain the fastest visible interval observed
+        // this session. The runtime's explicit refresh events take priority.
+        if(fs.shouldRender && observed>=60 && observed>atomic_load(&observed_hz))atomic_store(&observed_hz,observed);
+        unsigned physical=atomic_load(&physical_hz);
+        atomic_store(&target_vr_hz,physical?(float)physical:(float)(1e9/period));
     }
     if(high_rate && !headset_samples) {
         if(serial_high_rate())vr_rate_begin_source(&refresh_clock,fs.predictedDisplayTime,(int64_t)deadline);
@@ -1048,6 +1184,11 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                  vr_rate_more(&refresh_clock,fs.predictedDisplayTime,period);
     } while(more_samples);
 done:
+    if (desired) {
+        extern uint64_t rq_frame_list_ns(void);
+        uint64_t elapsed = SDL_GetTicksNS() - begin_work;
+        odyssey_native_delivery(desired,completed,only_draw,rq_frame_list_ns() + (elapsed > runtime_wait ? elapsed - runtime_wait : 0));
+    }
     if(interp_replay_ready()) {
         previous_head=simulation_head;
         memcpy(previous_projection,frame_projection,sizeof previous_projection);
@@ -1059,7 +1200,7 @@ done:
     }
     eye_history_active=completed;
     eye=-1;
-    interp_frame_rotate();
+    interp_frame_rotate(keep_history);
     return false;
 }
 

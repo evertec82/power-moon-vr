@@ -64,6 +64,27 @@ for _a in WIDE_SITES:
     PATCHES[_a] = _wide
 
 
+# These direct calls never visit the runtime dispatcher. Sample ModelKeeper while the
+# simulation owns it, and keep GPU-particle integration on gameplay ticks.
+def _capture_model(gen, a):
+    assert struct.unpack_from('<I', gen.nso.image, a - gen.base)[0] == 0xa9bd57f6
+    code = ' '.join(gen.render_single(gen.lift(a), a, None, set()))
+    return '{ extern void odyssey_pose_capture(Cpu *); odyssey_pose_capture(c); } ' + code
+
+
+def _particle_tick(gen, a):
+    ins = gen.lift(a)
+    assert ins.kind == 'bl' and ins.target == 0x7000b45ae8, f'{a:#x}: unexpected particle call'
+    code = ' '.join(gen.render_single(ins, a, None, set()))
+    return ('{ extern _Bool odyssey_skip_extra_particle_update(void); extern void f_7000b45ae8(Cpu *); '
+            'if (!odyssey_skip_extra_particle_update()) { ' + code + ' } }')
+
+
+PATCHES[0x700094c428] = _capture_model
+PATCHES[0x7000b398d0] = _particle_tick
+PATCHES[0x7000b39d2c] = _particle_tick
+
+
 # Debug hooks (make gen with ODYSSEY_HOOKS=<addr>[,<addr>...], hex): each listed instruction first calls the runtime's
 # odyssey_debug_hook(c, addr) (runtime/hle/odyssey_debug.c, ODYSSEY_HOOK_LOG says what it logs), then runs as usual.
 # Only instructions that fall through or return (no branches).

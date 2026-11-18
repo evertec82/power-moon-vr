@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "../../paths.h"
+#include "../../odyssey_pose.h"
 #include "../../settings.h"
 #include "../../ui/menu.h"
 #include "vk.h"
@@ -1084,7 +1085,7 @@ static void *interp_thread(void *arg) {
             if (mid) presenter_queue(mid, (uint64_t)due, order - 1, "in-between");
             presenter_queue(j.game, (uint64_t)(due + (int64_t)(j.period / 2)), order, "game image");
         }
-        interp_frame_rotate();
+        interp_frame_rotate(true);
         interp_log_stats();
         uint64_t now = plat_now_ns();
         if (getenv("ODYSSEY_INTERP_LOG") && now - last_log > 2000000000ull && njobs) {
@@ -1270,6 +1271,8 @@ void backend_present(NvnTexture *t) {
     bool handed = fd.done && fd.frame == total_frames && fd.game_w;
     if (!handed) vk_render_lock();
     backend_present_locked(t, handed);
+    // All command records, including both VR eyes, have consumed the palette.
+    odyssey_pose_render_frame(NULL);
     if (!handed) vk_render_unlock();
 }
 static void backend_present_locked(NvnTexture *t, bool handed) {

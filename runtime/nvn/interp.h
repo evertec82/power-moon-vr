@@ -43,7 +43,7 @@ InterpFrame *interp_frame_close(bool log_next, uint64_t frame_no);
 void interp_frame_drop(InterpFrame *f);
 bool interp_frame_begin(InterpFrame *f);
 // VR replays the current simulation frame without temporal interpolation, including across camera cuts.
-bool interp_frame_current(InterpFrame *f);
+bool interp_frame_current(InterpFrame *f, bool keep_history);
 bool interp_replay_ready(void);
 void interp_use_current(void);
 // The backend's executor state at the frame's first list (saved while logging), where its replay starts.
@@ -61,7 +61,7 @@ uint32_t interp_handles(const uint64_t **out);
 void interp_replay_begin(void);
 void interp_replay_end(void);
 void interp_replay_report(void);
-void interp_frame_rotate(void);           // (interpolation thread) after a frame: it becomes the previous one
+void interp_frame_rotate(bool keep_history); // after a frame: keep for matching, or release after its last eye
 void interp_log_stats(void);  // (interpolation thread, per game frame) a line every ODYSSEY_INTERP_LOG seconds (default 2)
 
 

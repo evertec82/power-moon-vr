@@ -15,6 +15,14 @@ Download the Windows runtime package from [Releases](https://github.com/evertec8
 
 The package contains the base app and setup tools, but no game content. A game-library build-ID mismatch requires rebuilding the library locally from your own files. Windows 10/11 x64 and a Vulkan-capable GPU driver are required; system/driver DLLs are not redistributed.
 
+## Experimental native refresh
+
+This branch can draw additional gameplay frames at the headset refresh rate while Odyssey continues to update gameplay at 60 ticks per second. Each additional stage draw samples the headset camera, prepares the stage graphics and samples supported character animations. The renderer submits each eye pair with the head pose used to draw it. Other actors and effects can still animate at their original rate. The title screen, loading and unsupported scenes use the original cadence. If stereo delivery stays below 58 frames per second, the renderer falls back to a 60 Hz source cadence and retries when sustained render time allows it.
+
+Build both the runtime and your local game library from this branch. Copy the three files in `launchers/native-refresh/` beside the experimental executable in a separate installation. The 4× launcher renders at 3840×2160 and the lighter 2× launcher at 1920×1080. Each uses SteamVR's active refresh rate. The settings and save belong to that installation. For a headset comparison, use the same save and refresh setting, press F10 in gameplay, and compare SteamVR's application frame timing while moving Mario and turning your head. The test writes native draw rate, gameplay tick rate and stereo submission rate to `PowerMoonRecomp.log`.
+
+The stage draw preparation and skeletal sampling adapt the MIT-licensed work in [Super Odyssey PC Recomp](https://github.com/Simon3Sarkis/super-odyssey-pc-recomp/blob/052d390f4e741aa7ae964bd8de3e4520f6c8ca9e/runtime/hle/odyssey_120.c).
+
 ## Controls
 
 | Control | Action |

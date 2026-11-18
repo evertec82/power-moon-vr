@@ -13,6 +13,7 @@
 
 #include "../hle.h"
 #include "../kernel.h"
+#include "../odyssey_pose.h"
 #include "../platform.h"
 #include "nvn.h"
 #include "rqueue.h"
@@ -37,6 +38,8 @@ static _Atomic int q_presents;             // presents queued and not yet done
 static pthread_mutex_t q_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t q_cv = PTHREAD_COND_INITIALIZER, q_done_cv = PTHREAD_COND_INITIALIZER;
 static __thread bool on_thread;
+static __thread uint64_t list_ns, frame_list_ns;
+uint64_t rq_frame_list_ns(void) { return frame_list_ns; }
 
 bool rq_enabled(void) {
 #ifdef __APPLE__
@@ -63,19 +66,28 @@ static void *render_thread(void *arg) {
         static uint64_t rt_ns[3];
         static int rt_n;
         if (rt_log < 0) rt_log = getenv("ODYSSEY_LOG_RENDER_TIME") != NULL;
-        uint64_t t0 = rt_log ? plat_now_ns() : 0;
+        static int native_timing = -1;
+        if (native_timing < 0) {
+            const char *e = getenv("ODYSSEY_VR_NATIVE_DRAW"); native_timing = e && atoi(e);
+        }
+        uint64_t t0 = rt_log || (native_timing && it.type == RQ_EXEC) ? plat_now_ns() : 0;
         switch (it.type) {
         case RQ_EXEC: backend_execute(it.a); break;
         case RQ_FENCE: { NvnSync *s = it.p; s->seq = renderer_fence_seq(); __atomic_store_n(&s->signaled, 1, __ATOMIC_RELEASE); break; }
         case RQ_FRAME:
+            frame_list_ns = list_ns;
+            list_ns = 0;
 #ifndef __APPLE__
             vr_camera_queued(&it.camera);
 #endif
             backend_frame_done(it.p, it.a); break;
         case RQ_PRESENT: backend_present(it.p); atomic_fetch_sub(&q_presents, 1); break;
+        case RQ_ODYSSEY_POSE: odyssey_pose_render_frame(it.p); break;
         }
+        uint64_t elapsed = t0 ? plat_now_ns() - t0 : 0;
+        if (native_timing && it.type == RQ_EXEC) list_ns += elapsed;
         if (rt_log) {
-            rt_ns[it.type == RQ_PRESENT ? 2 : it.type == RQ_FRAME ? 1 : 0] += plat_now_ns() - t0;
+            rt_ns[it.type == RQ_PRESENT ? 2 : it.type == RQ_FRAME ? 1 : 0] += elapsed;
             if (it.type == RQ_PRESENT && ++rt_n == 600) {
                 LOG("[render-time] lists %.2f ms, frame hand-over %.2f ms, present %.2f ms a frame\n", rt_ns[0] / 600.0 / 1e6,
                     rt_ns[1] / 600.0 / 1e6, rt_ns[2] / 600.0 / 1e6);

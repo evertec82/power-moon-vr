@@ -5,7 +5,8 @@
 typedef struct {
     float fovy,aspect,nearz,farz;
     float orientation[4],position[3];
-    bool valid,title_menu;
+    bool valid,title_menu,draw_only,has_draw_pose;
+    unsigned desired_hz;
     int64_t pose_time;
 } VrCameraState;
 void vr_camera_snapshot(VrCameraState *out);

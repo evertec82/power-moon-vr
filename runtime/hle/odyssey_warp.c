@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "../hle.h"
+#include "../odyssey_native_draw.h"
 #include "../rt.h"
 
 #define STAGE_SCENE_HOLDER 0x2d0      // StageScene::mGameDataHolder (OdysseyDecomp StageScene.h; control() loads it)
@@ -145,6 +146,10 @@ bool odyssey_scene_warming(void) {
     uint64_t now = renderer_present_count() + 1, last = g_last_control, start = g_scene_start;
     return !last || now - last > 2 || now - start < WARMUP_FRAMES;
 }
+bool odyssey_stage_ready_for_draws(void) {
+    uint64_t now = renderer_present_count() + 1, last = g_last_control, start = g_scene_start;
+    return !g_scene_new && last && start && now - last <= 5 && now - start >= WARMUP_FRAMES;
+}
 
 static void stage_scene_init(Cpu *c) {
     extern void odyssey_vr_scene_reset(void);odyssey_vr_scene_reset();
@@ -205,6 +210,7 @@ static void title_scene_control(Cpu *c) {
 #endif
 
 void odyssey_boot(void) {
+    odyssey_native_draw_boot();
 #ifndef __APPLE__
     extern void odyssey_vr_lighting_init(void);
     odyssey_vr_lighting_init();

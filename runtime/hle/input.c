@@ -37,6 +37,8 @@ static uint16_t rumble_low,rumble_high;
 static uint64_t rumble_at;
 static SDL_JoystickID rumble_pad;
 static _Atomic int64_t sampling;
+static _Thread_local uint64_t native_tick_presses;
+void input_native_tick_end(void) { native_tick_presses = 0; }
 
 // Host keys / buttons held by a test script (ODYSSEY_HOST_INPUT, input_frame): they go through the bindings
 static uint8_t test_keys[SDL_SCANCODE_COUNT];
@@ -420,6 +422,17 @@ uint64_t input_buttons_now(void) {
 
 static int32_t clamp_axis(int32_t v) { return v > 32767 ? 32767 : v < -32767 ? -32767 : v; }
 
+// Only the guest's controller thread samples this latch. An edge seen during a
+// draw-only loop is delivered to exactly one subsequent controller update.
+void input_native_sample(bool tick) {
+    static _Thread_local uint64_t previous, pending;
+    uint64_t held = input_buttons_now();
+    if (menu_input_captured()) pending = 0;
+    else pending |= held & ~previous;
+    previous = held;
+    if (tick) { native_tick_presses = pending; pending = 0; }
+}
+
 // NpadFullKeyState / NpadHandheldState / NpadJoy*State share this layout (0x28 bytes):
 // {int64 sampling, u64 buttons, AnalogStick L {x,y}, AnalogStick R {x,y}, u32 attributes}
 static void fill_state(Cpu *c) {
@@ -441,7 +454,7 @@ static void fill_state(Cpu *c) {
     }
     bool menu = menu_input_captured();  // the overlay menu / name entry has the controls (typing there isn't for the game)
     VrControllerState vr=vr_controls_now();
-    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons | vr.buttons;
+    uint64_t b = menu ? script_buttons : key_buttons | pad_buttons | script_buttons | vr.buttons | native_tick_presses;
     {   // injected Plus: held for ~10 presented frames (the game polls several times per frame)
         extern uint64_t renderer_present_count(void);
         static uint64_t until;

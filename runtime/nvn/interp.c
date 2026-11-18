@@ -1100,12 +1100,13 @@ bool interp_replay_ready(void) {
     return cur && !cur->overflow && !cur->destroyed && cur->state_n && cur->nhandles;
 }
 void interp_use_current(void) {
-    if(cur) for(uint32_t i=0;i<cur->ncbs;i++) cur->cbs[i].blend=-1;
+    if(cur && can_blend) for(uint32_t i=0;i<cur->ncbs;i++) cur->cbs[i].blend=-1;
 }
-bool interp_frame_current(InterpFrame *f) {
+bool interp_frame_current(InterpFrame *f, bool keep_history) {
     cur = (Frame *)f;
     can_blend = false;
     if (!cur) return false;
+    if (!keep_history) return interp_replay_ready();  // each newly logged buffer already has blend = -1
     // A current-only frame may become the previous frame of a later interpolation.
     // Clear pairing from the recycled slot and record its actual object identities.
     for(uint32_t j=0;j<cur->ndraws;j++) cur->draws[j].pair=-1;
@@ -1234,8 +1235,15 @@ void interp_replay_report(void) {
         (unsigned long long)(st_replay_cb_miss-rp_cb_miss_start));
 }
 
-void interp_frame_rotate(void) {
+void interp_frame_rotate(bool keep_history) {
     if (!cur) return;
+    if (!keep_history) {
+        interp_frame_drop((InterpFrame *)cur);
+        cur = NULL;
+        prev_valid = false;
+        history_reset = true;
+        return;
+    }
     pthread_mutex_lock(&fr_lock);
     prev2->busy = false;  // (the oldest goes back to the free slots)
     pthread_mutex_unlock(&fr_lock);
