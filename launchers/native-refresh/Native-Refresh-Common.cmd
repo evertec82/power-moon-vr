@@ -70,5 +70,5 @@ set "ODYSSEY_INPUT="
 set "ODYSSEY_SHOT_AT="
 set "ODYSSEY_SCREENSHOT_EVERY="
 set "ODYSSEY_EXIT_AFTER_SHOT="
-start "" /D "%~dp0" "%~dp0PowerMoonRecomp.exe" > "%~dp0PowerMoonRecomp.log" 2>&1
+"%~dp0PowerMoonRecomp.exe" > "%~dp0PowerMoonRecomp.log" 2>&1
 endlocal
