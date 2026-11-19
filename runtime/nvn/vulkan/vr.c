@@ -888,12 +888,16 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
         if(renderer_present_count()+30>=at || renderer_present_count()>=bench_start) {
             static int clear_ab=-1;
             if(clear_ab<0)clear_ab=getenv("ODYSSEY_VR_BENCH_CLEAR_AB")!=NULL;
+            static int prepare_ab=-1;
+            if(prepare_ab<0)prepare_ab=getenv("ODYSSEY_VR_BENCH_PREPARE_AB")!=NULL;
+            extern void vk_vr_prepare_override(int mode);
             int bench_variant=-1;
-            if(clear_ab && renderer_present_count()>=bench_start) {
+            if((clear_ab || prepare_ab) && renderer_present_count()>=bench_start) {
                 uint64_t f=renderer_present_count();
                 // ABBA balances both even/odd game passes in a single run.
                 bench_variant=(int)((f^(f>>1))&1);
-                vk_vr_load_clear_override(bench_variant);
+                if(prepare_ab) vk_vr_prepare_override(bench_variant);
+                else vk_vr_load_clear_override(bench_variant);
             }
             uint64_t bench_at=SDL_GetTicksNS(),bench_cpu=0;
             extern void renderer_save_texture_tex(TexBackend *,const char *);
@@ -1000,8 +1004,8 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                         s->n++;s->cpu+=bench_cpu;s->total+=elapsed;vr_metrics_observe(&s->times,elapsed);
                         if(n%120==0 || capture)for(int mode=0;mode<2;mode++)if(variants[mode].n) {
                             __typeof__(variants[0]) *v=&variants[mode];
-                            LOG("[vr-clear-ab] mode %d, %llu pairs: CPU %.3f ms; complete %.3f ms; p95 %.3f ms; max %.3f ms\n",
-                                mode,(unsigned long long)v->n,v->cpu/(double)v->n/1e6,v->total/(double)v->n/1e6,
+                            LOG("[vr-%s-ab] mode %d, %llu pairs: CPU %.3f ms; handoff %.3f ms; p95 %.3f ms; max %.3f ms\n",
+                                prepare_ab?"prepare":"clear",mode,(unsigned long long)v->n,v->cpu/(double)v->n/1e6,v->total/(double)v->n/1e6,
                                 vr_metrics_percentile(&v->times,95),v->times.longest/1e6);
                         }
                     }
@@ -1009,7 +1013,10 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                     if(n%120==0 || capture) LOG("[vr-bench] %llu pairs: translate %.3f ms/pair; replay and handoff %.3f ms/pair\n",(unsigned long long)n,cpu/(double)n/1e6,total/(double)n/1e6);
                 }
             }
-            if(bench_variant>=0)vk_vr_load_clear_override(-1);
+            if(bench_variant>=0) {
+                if(prepare_ab) vk_vr_prepare_override(-1);
+                else vk_vr_load_clear_override(-1);
+            }
             completed=all_eyes;
             if(capture) {
                 LOG("[vr-check] captured sequence frame %llu; title panel %d; first person requested %d applied %d\n",(unsigned long long)renderer_present_count(),frame_title_menu,vr_first_person_requested(),vr_first_person_applied());
@@ -1205,6 +1212,8 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                  vr_rate_more(&refresh_clock,fs.predictedDisplayTime,period);
     } while(more_samples);
 done:
+    // Also release preparation if the runtime did not acquire the second eye.
+    { extern void vk_vr_prepare_finish(void); vk_vr_prepare_finish(); }
     if (desired) {
         extern uint64_t rq_frame_list_ns(void);
         uint64_t elapsed = SDL_GetTicksNS() - begin_work;

@@ -585,6 +585,8 @@ static int new_chunk(uint64_t size) {
 }
 
 static void ring_retire(void) {}  // chunks are recycled lazily in vk_transient
+static int preparing_eye = -1;
+static uint64_t shared_uniform_floor, shared_uniform_generation;
 
 VkSpan vk_transient(uint64_t size, uint64_t align) {
     if (align < 16) align = 16;
@@ -602,7 +604,8 @@ VkSpan vk_transient(uint64_t size, uint64_t align) {
     uint64_t done = vk_completed_seq();
     int pick = -1;
     for (int i = 0; i < nchunks; i++)
-        if (i != active && chunks[i].seq <= done && chunks[i].size >= size) { pick = i; break; }
+        if (i != active && chunks[i].seq <= done && chunks[i].size >= size &&
+            (!shared_uniform_floor || chunks[i].seq < shared_uniform_floor)) { pick = i; break; }
     if (pick < 0) pick = new_chunk(size > CHUNK_SIZE ? size : CHUNK_SIZE);
     active = pick;
     chunks[pick].used = size;
@@ -665,6 +668,22 @@ static VkSpan guest_copy(uint64_t addr, uint64_t size) {
     VkSpan s = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
     gcopy[slot].addr = addr; gcopy[slot].size = size; gcopy[slot].seq = seq; gcopy[slot].span = s;
     return s;
+}
+
+// These uploads hold frame-owned uniform bytes. Protect the first eye's
+// ring ranges until the other eye extends their lifetime to its submission.
+static VkSpan shared_uniform_copy(uint64_t addr, uint64_t size) {
+    static struct { uint64_t address, size, generation; VkSpan span; int chunk; } copies[GCOPY_TAB];
+    uint64_t h = (addr * 0x9E3779B97F4A7C15ull) ^ (size * 0xC2B2AE3D27D4EB4Full);
+    unsigned slot = (h ^ (h >> 32)) & (GCOPY_TAB - 1);
+    __typeof__(*copies) *copy = &copies[slot];
+    if (copy->generation == shared_uniform_generation && copy->address == addr && copy->size == size) {
+        chunks[copy->chunk].seq = vk_pending_seq();
+        return copy->span;
+    }
+    VkSpan span = vk_transient_copy((const void *)(uintptr_t)addr, size, 256);
+    *copy = (__typeof__(*copies)){addr, size, shared_uniform_generation, span, active};
+    return span;
 }
 
 // Set per draw, before either shader stage uploads its uniform buffers.
@@ -1762,6 +1781,8 @@ typedef struct {
     VkShaderModule vs, fs;
     VkBindingInfo binds[MAX_BIND];
     int nbinds;
+    uint8_t binding_order[2][MAX_BIND];
+    uint8_t binding_primary[2], binding_total[2];
     VkDescriptorSetLayout set_layout[2];
     VkPipelineLayout layout,lib_layout[2];
     bool vs_uses_vid;
@@ -1785,7 +1806,25 @@ static void make_shader_libs(Prog *p, bool cached_only);
 static void huge_link_test(Prog *p);
 static __thread bool t_build_here;  // (blocking builds) a step goes on with the next one itself
 
+static bool late_shader_binding(const VkBindingInfo *b) {
+    return b->type == VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER &&
+           (b->binding == 18 || b->binding == 19 || b->binding == GMAP_BUFFER_INDEX);
+}
+
 static VkPipelineLayout make_layout(Prog *p, int nsets, VkShaderStageFlags s0, VkShaderStageFlags s1) {
+    // Reflect the binding order once per program, including the uniforms
+    // whose calculations need the texture sizes resolved earlier in a draw.
+    for (int set = 0; set < nsets; ++set) {
+        unsigned count = 0;
+        for (int i = 0; i < p->nbinds; ++i)
+            if (p->binds[i].set == (uint32_t)set && !late_shader_binding(&p->binds[i]))
+                p->binding_order[set][count++] = i;
+        p->binding_primary[set] = count;
+        for (int i = 0; i < p->nbinds; ++i)
+            if (p->binds[i].set == (uint32_t)set && late_shader_binding(&p->binds[i]))
+                p->binding_order[set][count++] = i;
+        p->binding_total[set] = count;
+    }
     p->set_layout[0] = vk_set_layout(p->binds, p->nbinds, 0, s0);
     if (nsets > 1) p->set_layout[1] = vk_set_layout(p->binds, p->nbinds, 1, s1);
     // graphics: the vertex attribute kinds (GLSL contract in shader.h), the same range in every layout so the values
@@ -3907,7 +3946,8 @@ static VkDescriptorBufferInfo cbuf_info(int stage, ShaderInfo *si, int k, uint32
     // snapshot: later CPU writes must not leak in. Shared by the draws of one submission binding the same range:
     // within a command list nothing writes guest memory (no inline UpdateUniformBuffer: that writes through below
     // and drops the shared copies).
-    return ubo_span(guest_copy(src, size), size);
+    bool owned = preparing_eye >= 0 && src != r.addr;
+    return ubo_span(owned ? shared_uniform_copy(src, size) : guest_copy(src, size), size);
 }
 
 // Global memory (shader LDG/STG, maxwell_gmem_base = HEAP_BASE): the guest heap imported as a GPU buffer
@@ -4377,9 +4417,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
     float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
     if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
     rs[65][0] = g_mirror_w;
-    for (int i = 0; i < p->nbinds; i++) {
-        VkBindingInfo *b = &p->binds[i];
-        if (b->set != set) continue;
+    for (unsigned i = 0; i < p->binding_primary[set]; i++) {
+        const VkBindingInfo *b = &p->binds[p->binding_order[set][i]];
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->type == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER && b->binding >= 32) {
@@ -4404,10 +4443,8 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         }
         n++;
     }
-    for (int i = 0; i < p->nbinds; i++) {
-        VkBindingInfo *b = &p->binds[i];
-        if (b->set != set || b->type != VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER ||
-            (b->binding != 18 && b->binding != 19 && b->binding != GMAP_BUFFER_INDEX)) continue;
+    for (unsigned i = p->binding_primary[set]; i < p->binding_total[set]; i++) {
+        const VkBindingInfo *b = &p->binds[p->binding_order[set][i]];
         w[n] = (VkWriteDescriptorSet){.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, .dstSet = ds, .dstBinding = b->binding,
                                       .descriptorCount = 1, .descriptorType = b->type};
         if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
@@ -4579,6 +4616,168 @@ static bool topology(uint32_t mode, VkPrimitiveTopology *t, uint8_t *cls) {
     }
 }
 
+static Pipe *draw_pipeline(const CmdRec *r, Prog *pr, uint8_t cls, uint32_t akind[4]) {
+    PipeKey k;
+    memset(&k, 0, sizeof k);
+    k.prog = pr;
+    k.ncolor = pass_ncolor;
+    memcpy(k.color, pass_color, sizeof k.color);
+    k.depth = pass_depth;
+    k.stencil = pass_stencil;
+    k.samples = pass_samples;
+    k.attr_mask = pr->vi->attr_mask;
+    for (uint32_t remaining = k.attr_mask; remaining; remaining &= remaining - 1) {
+        int i = __builtin_ctz(remaining);
+        uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
+        uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
+        if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
+            k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
+            k.attr_bind[i] = ZERO_BINDING;
+            k.used_streams |= 1u << ZERO_BINDING;
+            continue;
+        }
+        uint32_t kind;
+        k.attr_fmt[i] = vertex_format_supported(vertex_input_format(fmt, &kind));
+        akind[i >> 3] |= kind << ((i & 7) * 4);
+        k.attr_off[i] = off;
+        k.attr_bind[i] = stream;
+        k.used_streams |= 1u << stream;
+    }
+    for (uint32_t remaining = k.used_streams & 0xffffu; remaining; remaining &= remaining - 1) {
+        int s = __builtin_ctz(remaining);
+        k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
+        k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
+        if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
+    }
+    for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
+        if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
+        // Targets the fragment shader doesn't output keep their contents on Metal, but are undefined in Vulkan
+        // (NVIDIA writes black): mask them. Foliage depth pre-passes left black silhouettes (user 2026-10-08).
+        k.write_mask[i] = ((pr->fi->out_mask >> (i * 4)) & 0xF) ? (st.channel_mask >> (i * 4)) & 0xF : 0;
+        if (((st.color_state[0] >> i) & 1) && !rt_kind(st.rt.color[i]->format)) {
+            k.blend_on |= (uint8_t)(1u << i);
+            memcpy(k.blend[i], st.blend[i], 8);
+        }
+    }
+    k.a2c = st.ms[0xC] != 0;
+    k.topo_class = cls;
+    k.poly_fill = st.poly[2] != 1;
+    // The two eyes replay the same command records. Compare the complete key
+    // against the last lookup for this record before hashing ~700 bytes again.
+    // A hint stores a table index so that it cannot outlive a pipeline.
+    static uint16_t pipe_hints[8192];
+    uintptr_t record = (uintptr_t)r;
+    unsigned hint = ((record >> 5) ^ (record >> 17)) & 8191;
+    uint32_t pslot = pipe_hints[hint];
+    Pipe *pp = pipe_tab[pslot].pipe;
+    uint64_t ph = 0;
+    if (!pp || memcmp(&pp->k, &k, sizeof k)) {
+        ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
+        if (!ph) ph = 1;
+        pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
+        uint32_t probes = 0;
+        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph && ++probes < PIPE_TAB) pslot = (pslot + 1) & (PIPE_TAB - 1);
+        if (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) {
+            static int full;
+            if (!full++) LOG("[vk] pipeline table full (%d)\n", PIPE_TAB);
+            return NULL;
+        }
+        pipe_hints[hint] = (uint16_t)pslot;
+        pp = pipe_tab[pslot].pipe;
+    }
+    if (!pp) {
+        pp = calloc(1, sizeof *pp);
+        pp->k = k;
+        pipe_tab[pslot].key = ph;
+        pipe_tab[pslot].pipe = pp;
+        static int logp = -1;
+        if (logp < 0) logp = getenv("ODYSSEY_LOG_PROGS") != NULL;
+        if (logp) LOG("[prog] pipe vs=%llx fs=%llx frame %llu ready %d\n", (unsigned long long)pr->code[0],
+                      (unsigned long long)pr->code[1], (unsigned long long)renderer_present_count(), atomic_load(&pr->state));
+        if (g_vk.gpl && link_pipeline(pp)) {}
+        else if (pr->huge) queue_job(build_pipeline, pp, 0);
+        else run_job(build_pipeline, pp);
+    }
+    return pp;
+}
+
+// The two eyes walk the same frame-owned command stream. Store only decoded
+// state and a graphics pipeline, never an attachment, uniform or descriptor.
+typedef struct {
+    const CmdRec *command;
+    VkPrimitiveTopology topology;
+    uint8_t topology_class, color_mask, blend_mask;
+    bool native;
+    Pipe *pipeline;
+    uint32_t attrib_kinds[4];
+    const CmdRec *attrib_binding, *stream_binding;
+    uint32_t channel_mask;
+    uint8_t blend[8][8];
+} PreparedDraw;
+
+enum { MAX_PREPARED_DRAWS = 8192 };
+static PreparedDraw prepared_draws[MAX_PREPARED_DRAWS];
+static const void *prepared_source;
+static unsigned prepared_count, prepared_index, prepared_hits, prepared_misses;
+static const CmdRec *replay_attrib_binding, *replay_stream_binding;
+static int prepare_override = -1;
+void vk_vr_prepare_override(int mode) { prepare_override = mode; }
+void vk_vr_prepare_finish(void) {
+    prepared_source = NULL;
+    shared_uniform_floor = 0;
+}
+
+static PreparedDraw *draw_preparation(const CmdRec *command) {
+    if (preparing_eye < 0 || prepared_index >= MAX_PREPARED_DRAWS) return NULL;
+    unsigned i = prepared_index++;
+    PreparedDraw *d = &prepared_draws[i];
+    if (preparing_eye == 0) {
+        d->command = command;
+        d->pipeline = NULL;
+        return d;
+    }
+    return i < prepared_count && d->command == command ? d : NULL;
+}
+
+static Pipe *prepared_pipeline(PreparedDraw *d, const CmdRec *command, Prog *pr, uint8_t cls, uint32_t akind[4]) {
+    if (!d) return draw_pipeline(command, pr, cls, akind);
+    uint8_t colors = 0, blends = 0;
+    for (unsigned i = 0; i < pass_ncolor && i < 8; ++i) {
+        NvnTexture *t = st.rt.color[i];
+        if (!t || pass_color[i] == VK_FORMAT_UNDEFINED) continue;
+        colors |= 1u << i;
+        if (((st.color_state[0] >> i) & 1) && !rt_kind(t->format)) blends |= 1u << i;
+    }
+    if (preparing_eye == 1 && d->pipeline) {
+        const PipeKey *p = &d->pipeline->k;
+        // Eye-specific passes can select different attachment formats. Check
+        // the actual bound formats and all NVN state that the pipeline bakes.
+        if (p->prog == pr && p->ncolor == pass_ncolor && p->depth == pass_depth && p->stencil == pass_stencil &&
+            p->samples == pass_samples && !memcmp(p->color, pass_color, sizeof p->color) &&
+            p->topo_class == cls && p->a2c == (st.ms[0xC] != 0) && p->poly_fill == (st.poly[2] != 1) &&
+            d->color_mask == colors && d->blend_mask == blends && d->channel_mask == st.channel_mask &&
+            d->attrib_binding == replay_attrib_binding && d->stream_binding == replay_stream_binding &&
+            (!blends || !memcmp(d->blend, st.blend, sizeof d->blend))) {
+            memcpy(akind, d->attrib_kinds, sizeof d->attrib_kinds);
+            ++prepared_hits;
+            return d->pipeline;
+        }
+        ++prepared_misses;
+    }
+    Pipe *p = draw_pipeline(command, pr, cls, akind);
+    if (preparing_eye == 0 && p) {
+        d->pipeline = p;
+        d->color_mask = colors;
+        d->blend_mask = blends;
+        d->channel_mask = st.channel_mask;
+        d->attrib_binding = replay_attrib_binding;
+        d->stream_binding = replay_stream_binding;
+        if (blends) memcpy(d->blend, st.blend, sizeof d->blend);
+        memcpy(d->attrib_kinds, akind, sizeof d->attrib_kinds);
+    }
+    return p;
+}
+
 static void draw_(CmdRec *r, bool indexed);
 static void draw(CmdRec *r, bool indexed) {
     PROF_T0();
@@ -4609,6 +4808,7 @@ static bool ui2d_covers_screen(const float *u, uint64_t size) {
 }
 
 static void draw_(CmdRec *r, bool indexed) {
+    PreparedDraw *prepared = draw_preparation(r);
     vr_screen_shadow=false; vr_geometry_pass=false;
     memset(tex_screen_uv,0,sizeof tex_screen_uv);
     float ui_scale=1;
@@ -4639,7 +4839,15 @@ static void draw_(CmdRec *r, bool indexed) {
                 fkey.rt_kind[i] = 3;
         }
     }
-    Prog *pr = get_program(st.program, &vkey, &fkey);
+    Prog *pr = NULL;
+    if (prepared && preparing_eye == 1 && prepared->pipeline && (st.program->stage_mask & 3) == 3) {
+        Prog *left = prepared->pipeline->k.prog;
+        if (left->code[0] == st.program->stages[0].code_addr && left->code[1] == st.program->stages[1].code_addr &&
+            !memcmp(&left->vkey, &vkey, sizeof vkey) &&
+            !memcmp(left->fkey.rt_kind, fkey.rt_kind, sizeof fkey.rt_kind))
+            pr = left;
+    }
+    if (!pr) pr = get_program(st.program, &vkey, &fkey);
     if (!pr || !(pr->huge ? atomic_load(&pr->state) == 1 : built(&pr->state))) {  // (a huge one never waits)
         stat_skipped++;
         if (pr && atomic_load(&pr->state) == 2) prog_tell_failure(pr);
@@ -4744,99 +4952,32 @@ static void draw_(CmdRec *r, bool indexed) {
     uint32_t mode = (uint32_t)r->x[0];
     VkPrimitiveTopology topo;
     uint8_t cls;
-    bool native = topology(mode, &topo, &cls);
+    bool native;
+    if (prepared && preparing_eye == 1 && prepared->pipeline) {
+        topo = prepared->topology;
+        cls = prepared->topology_class;
+        native = prepared->native;
+    } else {
+        native = topology(mode, &topo, &cls);
+        if (prepared && preparing_eye == 0) {
+            prepared->topology = topo;
+            prepared->topology_class = cls;
+            prepared->native = native;
+        }
+    }
     if (!native && mode != 6 && mode != 7 && mode != 9) { stat_skipped++; return; }
 
     uint64_t prof_tk_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_pre += prof_tk_ - prof_tp_;
     // ---- pipeline
-    PipeKey k;
-    memset(&k, 0, sizeof k);
     uint32_t akind[4] = {0};
-    k.prog = pr;
-    k.ncolor = pass_ncolor;
-    memcpy(k.color, pass_color, sizeof k.color);
-    k.depth = pass_depth;
-    k.stencil = pass_stencil;
-    k.samples = pass_samples;
-    k.attr_mask = pr->vi->attr_mask;
-    for (uint32_t remaining = k.attr_mask; remaining; remaining &= remaining - 1) {
-        int i = __builtin_ctz(remaining);
-        uint32_t a = i < st.nattrib ? st.attrib[i] : 0x2E;
-        uint32_t fmt = a & 0xFF, stream = (a >> 8) & 0x1F, off = a >> 13;
-        if (i >= st.nattrib || fmt == 0 || stream >= 16) {  // unbound attribute: (0, 0, 0, 1) from a constant stream
-            k.attr_fmt[i] = VK_FORMAT_R32G32B32A32_SFLOAT;
-            k.attr_bind[i] = ZERO_BINDING;
-            k.used_streams |= 1u << ZERO_BINDING;
-            continue;
-        }
-        uint32_t kind;
-        k.attr_fmt[i] = vertex_format_supported(vertex_input_format(fmt, &kind));
-        akind[i >> 3] |= kind << ((i & 7) * 4);
-        k.attr_off[i] = off;
-        k.attr_bind[i] = stream;
-        k.used_streams |= 1u << stream;
-    }
-    for (uint32_t remaining = k.used_streams & 0xffffu; remaining; remaining &= remaining - 1) {
-        int s = __builtin_ctz(remaining);
-        k.stride[s] = s < st.nstream ? st.stream[s][0] : 0;
-        k.divisor[s] = s < st.nstream && k.stride[s] ? st.stream[s][1] : 0;
-        if (k.divisor[s] > 1 && !g_vk.divisor) k.divisor[s] = 1;
-    }
-    for (uint32_t i = 0; i < k.ncolor && i < 8; i++) {
-        if (!st.rt.color[i] || k.color[i] == VK_FORMAT_UNDEFINED) continue;
-        // Targets the fragment shader doesn't output keep their contents on Metal, but are undefined in Vulkan
-        // (NVIDIA writes black): mask them. Foliage depth pre-passes left black silhouettes (user 2026-10-08).
-        k.write_mask[i] = ((pr->fi->out_mask >> (i * 4)) & 0xF) ? (st.channel_mask >> (i * 4)) & 0xF : 0;
-        if (((st.color_state[0] >> i) & 1) && !rt_kind(st.rt.color[i]->format)) {
-            k.blend_on |= (uint8_t)(1u << i);
-            memcpy(k.blend[i], st.blend[i], 8);
-        }
-    }
-    k.a2c = st.ms[0xC] != 0;
-    k.topo_class = cls;
-    k.poly_fill = st.poly[2] != 1;
-    // The two eyes replay the same command records. Compare the complete key
-    // against the last lookup for this record before hashing ~700 bytes again.
-    // A hint stores a table index so that it cannot outlive a pipeline.
-    static uint16_t pipe_hints[8192];
-    uintptr_t record = (uintptr_t)r;
-    unsigned hint = ((record >> 5) ^ (record >> 17)) & 8191;
-    uint32_t pslot = pipe_hints[hint];
-    Pipe *pp = pipe_tab[pslot].pipe;
-    uint64_t ph = 0;
-    if (!pp || memcmp(&pp->k, &k, sizeof k)) {
-        ph = hash_words(0xcbf29ce484222325ull, &k, sizeof k);
-        if (!ph) ph = 1;
-        pslot = (uint32_t)(ph ^ (ph >> 29)) & (PIPE_TAB - 1);
-        uint32_t probes = 0;
-        while (pipe_tab[pslot].key && pipe_tab[pslot].key != ph && ++probes < PIPE_TAB) pslot = (pslot + 1) & (PIPE_TAB - 1);
-        if (pipe_tab[pslot].key && pipe_tab[pslot].key != ph) {
-            static int full;
-            if (!full++) LOG("[vk] pipeline table full (%d)\n", PIPE_TAB);
-            stat_skipped++;
-            return;
-        }
-        pipe_hints[hint] = (uint16_t)pslot;
-        pp = pipe_tab[pslot].pipe;
-    }
-    if (!pp) {
-        pp = calloc(1, sizeof *pp);
-        pp->k = k;
-        pipe_tab[pslot].key = ph;
-        pipe_tab[pslot].pipe = pp;
-        static int logp = -1;
-        if (logp < 0) logp = getenv("ODYSSEY_LOG_PROGS") != NULL;
-        if (logp) LOG("[prog] pipe vs=%llx fs=%llx frame %llu ready %d\n", (unsigned long long)pr->code[0],
-                      (unsigned long long)pr->code[1], (unsigned long long)renderer_present_count(), atomic_load(&pr->state));
-        if (g_vk.gpl && link_pipeline(pp)) {}
-        else if (pr->huge) queue_job(build_pipeline, pp, 0);
-        else run_job(build_pipeline, pp);
-    }
+    Pipe *pp = prepared_pipeline(prepared, r, pr, cls, akind);
+    if (!pp) { stat_skipped++; return; }
+    const PipeKey *k = &pp->k;
     if (!(pr->huge ? atomic_load(&pp->state) == 1 : built(&pp->state))) { stat_skipped++; return; }
     ss_enabled();
     if (ss_need(SS_PIPE, ss.pipe == pp->pipe)) { ss.pipe = pp->pipe; vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe); }
-    if (k.attr_mask && ss_need(SS_AK, !memcmp(ss.ak, akind, sizeof akind))) {
+    if (k->attr_mask && ss_need(SS_AK, !memcmp(ss.ak, akind, sizeof akind))) {
         memcpy(ss.ak, akind, sizeof akind);
         vkCmdPushConstants(cb, pr->layout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof akind, akind);
     }
@@ -5168,7 +5309,7 @@ static void draw_(CmdRec *r, bool indexed) {
 
     // ---- vertex streams: the range this draw can read, copied once per submission
     for (int s = 0; s < 17; s++) {
-        if (!(k.used_streams & (1u << s))) continue;
+        if (!(k->used_streams & (1u << s))) continue;
         VkSpan sp;
         if (s == ZERO_BINDING) {
             static const float zero[4] = {0, 0, 0, 1};
@@ -5190,9 +5331,9 @@ static void draw_(CmdRec *r, bool indexed) {
                 if (base_vertex > 0) max_index += (uint32_t)base_vertex;
                 scan_src = NULL;
             }
-            uint64_t stride = k.stride[s], need;
+            uint64_t stride = k->stride[s], need;
             if (!stride) need = 256;
-            else if (k.divisor[s]) need = ((uint64_t)base_inst + inst + k.divisor[s] - 1) / k.divisor[s] * stride + 256;
+            else if (k->divisor[s]) need = ((uint64_t)base_inst + inst + k->divisor[s] - 1) / k->divisor[s] * stride + 256;
             else need = (uint64_t)max_index * stride + 256;
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
@@ -6089,10 +6230,12 @@ static void exec_records(uint64_t p,int depth,uint64_t end,uint64_t handle) {
         case CMD_BIND_VERTEX_ATTRIB:
             st.nattrib = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
             memcpy(st.attrib, x, st.nattrib * 4);
+            if (preparing_eye >= 0) replay_attrib_binding = r;
             break;
         case CMD_BIND_VERTEX_STREAM:
             st.nstream = (int)r->x[0] > 16 ? 16 : (int)r->x[0];
             memcpy(st.stream, x, st.nstream * 8);
+            if (preparing_eye >= 0) replay_stream_binding = r;
             break;
         case CMD_BIND_VERTEX_BUFFERS:
             for (uint64_t i = 0; i < r->x[1] && r->x[0] + i < 16; i++) memcpy(&st.vbuf[r->x[0] + i], (uint8_t *)x + i * 16, 16);
@@ -6377,7 +6520,39 @@ void renderer_interp_replay(void) {
         snap_reason = "eye begin"; snapshots_invalidate(NULL); nfeedback = 0;
     }
     g_twin_redirect = twins;
+    static int shared_prep = -1;
+    if (shared_prep < 0) {
+        const char *setting = getenv("ODYSSEY_VR_PREPARE_DRAWS");
+        shared_prep = setting && atoi(setting) != 0;
+    }
+    if (prepare_override < 0 ? shared_prep : prepare_override) {
+        extern int vr_eye_index(void);
+        int eye = vr_eye_index();
+        if (eye == 0 || (eye == 1 && prepared_source == commands)) {
+            preparing_eye = eye;
+            prepared_index = 0;
+            // An unbound tracker refers to the same saved starting state.
+            // Subsequent bindings refer to immutable, frame-owned records.
+            replay_attrib_binding = replay_stream_binding = NULL;
+        }
+        if (eye == 0) {
+            prepared_source = commands;
+            shared_uniform_floor = vk_pending_seq();
+            ++shared_uniform_generation;
+        }
+    }
     exec_records((uint64_t)(uintptr_t)commands,0,(uint64_t)(uintptr_t)commands+command_bytes,0);
+    if (preparing_eye == 0) prepared_count = prepared_index;
+    if (preparing_eye == 1) {
+        vk_vr_prepare_finish();
+        static unsigned pairs;
+        if (++pairs % 120 == 0) {
+            LOG("[vr-prep] %u shared pipeline preparations, %u state mismatches across 120 eye pairs\n",
+                prepared_hits, prepared_misses);
+            prepared_hits = prepared_misses = 0;
+        }
+    }
+    preparing_eye = -1;
     vk_end_pass();
     g_twin_redirect = false;
     renderer_submit();
