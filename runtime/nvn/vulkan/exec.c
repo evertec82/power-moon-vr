@@ -1892,6 +1892,7 @@ static bool libs_from_cache(Prog *p) {
 }
 
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);
 static uint64_t code_sum(uint64_t code) { return hmix(1469598103934665603ull, (const void *)(uintptr_t)(code + 0x80), 64); }
 
 // A failed translation is logged when a draw needs the program (not for the thousands compiled ahead, most never drawn).
@@ -1984,7 +1985,7 @@ static void prog_need(Prog *p) {
 }
 
 #define PROG_TAB 65536  // (open addressing, never shrinks: a full table skips new programs instead of hanging)
-static struct { uint64_t key; Prog *prog; } prog_tab[PROG_TAB];
+static struct { uint64_t key; _Atomic(Prog *) prog; } prog_tab[PROG_TAB];
 static pthread_mutex_t prog_lock = PTHREAD_MUTEX_INITIALIZER;  // (draws: render thread; set-ups: the game's threads)
 static _Atomic int stat_ahead, stat_ahead_drawn;
 
@@ -1995,17 +1996,26 @@ enum { PF_DRAW, PF_AHEAD, PF_AHEAD_WARM, PF_PREFETCH };  // (warm: drawn in a sc
 static Prog *program_for(NvnProgram *np, const ShaderKey *vkey, const ShaderKey *fkey, int how) {
     bool ahead = how == PF_AHEAD || how == PF_AHEAD_WARM;
     if (!(np->stage_mask & 1) || !(np->stage_mask & 2)) return NULL;
-    uint64_t h = 0xcbf29ce484222325ull;
-    for (int i = 0; i < 2; i++) { uint64_t a = np->stages[i].code_addr; for (int k = 0; k < 8; k++) { h ^= (a >> (k * 8)) & 0xFF; h *= 0x100000001B3ull; } }
-    const uint8_t *vb = (const uint8_t *)vkey;
-    for (size_t i = 0; i < sizeof *vkey; i++) { h ^= vb[i]; h *= 0x100000001B3ull; }
-    for (int i = 0; i < 8; i++) { h ^= fkey->rt_kind[i]; h *= 0x100000001B3ull; }
+    uint64_t addresses[] = {np->stages[0].code_addr, np->stages[1].code_addr};
+    uint64_t h = hash_words(0xcbf29ce484222325ull, addresses, sizeof addresses);
+    h = hash_words(h, vkey, sizeof *vkey);
+    h = hash_words(h, fkey->rt_kind, sizeof fkey->rt_kind);
     if (!h) h = 1;
+    uint32_t home = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1);
+    uint32_t slot = home;
+    // Entries are immutable after release publication. A miss rechecks under
+    // the insertion lock in case the shader setup thread just added it.
+    for (uint32_t probes = 0; probes < PROG_TAB; ++probes, slot = (slot + 1) & (PROG_TAB - 1)) {
+        Prog *ready = atomic_load_explicit(&prog_tab[slot].prog, memory_order_acquire);
+        if (!ready) break;
+        if (prog_tab[slot].key == h) return ready;
+    }
     pthread_mutex_lock(&prog_lock);
-    uint32_t slot = (uint32_t)(h ^ (h >> 31)) & (PROG_TAB - 1), probes = 0;
+    slot = home;
+    uint32_t probes = 0;
     while (prog_tab[slot].key && prog_tab[slot].key != h && ++probes < PROG_TAB) slot = (slot + 1) & (PROG_TAB - 1);
     if (prog_tab[slot].key == h) {
-        Prog *p = prog_tab[slot].prog;
+        Prog *p = atomic_load_explicit(&prog_tab[slot].prog, memory_order_relaxed);
         pthread_mutex_unlock(&prog_lock);
         return p;
     }
@@ -2027,7 +2037,7 @@ static Prog *program_for(NvnProgram *np, const ShaderKey *vkey, const ShaderKey 
     if (ahead) for (int i = 0; i < 2; i++) p->code_sum[i] = code_sum(p->code[i]);
     if (how != PF_AHEAD) atomic_store(&p->urgent, true);
     prog_tab[slot].key = h;
-    prog_tab[slot].prog = p;
+    atomic_store_explicit(&prog_tab[slot].prog, p, memory_order_release);
     pthread_mutex_unlock(&prog_lock);
     static int logp = -1;
     if (logp < 0) logp = getenv("ODYSSEY_LOG_PROGS") != NULL;
@@ -2064,7 +2074,6 @@ static uint64_t drawn_tab[DRAWN_TAB];  // (hash | 1)
 static bool drawn_warm[DRAWN_TAB];
 static int drawn_n, drawn_new;
 static pthread_mutex_t drawn_lock = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t hash_words(uint64_t h, const void *p, size_t n);
 
 static uint64_t prog_code_hash(uint64_t vs, uint64_t vmax, uint64_t fs, uint64_t fmax) {
     uint64_t h = hash_words(0x9e3779b97f4a7c15ull, (const void *)(uintptr_t)vs, vmax < 2048 ? vmax : 2048);
@@ -3046,7 +3055,7 @@ static void prepare_list_write(bool force) {
     PrepItem *items = NULL;
     int n = 0, cap = 0;
     for (int i = 0; i < PROG_TAB; i++) {  // (no lock: entries are only ever added, a program's keys before PSTEP_LIBS)
-        Prog *p = prog_tab[i].prog;
+        Prog *p = atomic_load_explicit(&prog_tab[i].prog, memory_order_acquire);
         if (!p || !p->known || p->huge || atomic_load(&p->step) != PSTEP_LIBS || !p->spv_key[0] || !p->spv_key[1]) continue;
         char path[64];
         pbin_path(path, sizeof path, p, true, true);  // (the fragment one is saved second: it there, both are)

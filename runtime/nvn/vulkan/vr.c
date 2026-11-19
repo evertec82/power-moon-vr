@@ -219,8 +219,8 @@ static void rate_stats(bool game,bool rendered,bool blended) {
 // The default keeps the confirmed wait-before-release order. The optional
 // OpenXR rendering.adoc: release once commands referencing the image have
 // been submitted; Vulkan OpenXR calls share the externally synchronized queue.
-// Early handoff still retires GPU work before vr_frame returns: no worker and
-// no additional game frame in flight, only xrEndFrame overlaps the GPU tail.
+// Early handoff normally retires GPU work before vr_frame returns. The
+// overlap test can retire it at the next stereo draw instead.
 static bool vr_early_submit(void) {
     static int enabled=-1;
     if(enabled<0) { const char *e=getenv("ODYSSEY_VR_EARLY_SUBMIT"); enabled=e && atoi(e)!=0;
@@ -233,6 +233,15 @@ static void vr_wait_pair(uint64_t seq) {
     uint64_t start=SDL_GetTicksNS();
     renderer_wait_seq(seq);
     cost_add(C_GPUWAIT,start);
+}
+static bool vr_overlap_gpu(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *value = getenv("ODYSSEY_VR_OVERLAP_GPU");
+        enabled = value && atoi(value) != 0;
+        if (enabled) LOG("[vr] overlap final GPU submission with the next frame's CPU translation\n");
+    }
+    return enabled;
 }
 static bool capture_requested,eye_history_active;
 void vr_request_capture(void) { capture_requested=true; }
@@ -776,6 +785,12 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
 
 bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t deadline) {
     if(!frame) return false;
+    // Wait before using the eye targets again. The next native draw list
+    // can already have been translated by this point. The render owner still
+    // submits both eyes and the original pose in order on the same queue.
+    static uint64_t previous_pair;
+    vr_wait_pair(previous_pair);
+    previous_pair = 0;
     if(!offscreen_check&&vr_enabled()&&session){poll_events();vr_input_poll(session,focused);}
     static unsigned consecutive_skips;
     static uint64_t skipped;
@@ -829,6 +844,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     }
     bool completed=false;
     freeze_projection(*source_camera);
+    bool overlap = vr_overlap_gpu() && desired > 60 && !frame_title_menu && !capture_requested;
     static bool previous_title_menu;
     if(previous_title_menu!=frame_title_menu) {
         extern void vk_vr_history_reset(void);
@@ -971,7 +987,9 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
             all_eyes &= rendered_eyes == check_eyes;
             }
             if(bench_env) {
-                vk_wait_seq(vk_pending_seq()-1);
+                uint64_t seq = vk_pending_seq()-1;
+                if (overlap && !capture) previous_pair = seq;
+                else vk_wait_seq(seq);
                 static uint64_t n,cpu,total;
                 if(renderer_present_count()>=bench_start) {
                     uint64_t elapsed=SDL_GetTicksNS()-bench_at;
@@ -988,7 +1006,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                         }
                     }
                     rate_stats(false,all_eyes,false);
-                    if(n%120==0 || capture) LOG("[vr-bench] %llu pairs: translate %.3f ms/pair; complete %.3f ms/pair\n",(unsigned long long)n,cpu/(double)n/1e6,total/(double)n/1e6);
+                    if(n%120==0 || capture) LOG("[vr-bench] %llu pairs: translate %.3f ms/pair; replay and handoff %.3f ms/pair\n",(unsigned long long)n,cpu/(double)n/1e6,total/(double)n/1e6);
                 }
             }
             if(bench_variant>=0)vk_vr_load_clear_override(-1);
@@ -1173,7 +1191,10 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     vk_queue_unlock();
     if(!xr_ok(end_result,"end frame")) rendered=false;
     cost_add(C_END,end_at);
-    if(early_submit) vr_wait_pair(pair_seq);
+    if (early_submit) {
+        if (overlap && rendered && !high_rate) previous_pair = pair_seq;
+        else vr_wait_pair(pair_seq);
+    }
     completed=rendered;
     if(rendered) vr_metrics_record(&frame_metrics,SDL_GetTicksNS());
     if(rendered && capture_requested) { capture_requested=false; LOG("[vr] paired eye capture complete\n"); }
