@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.12
+
+- Share decoded graphics pipeline state and uploads of frame-owned uniforms between the two eye renders. Each eye still resolves its own attachments and camera-dependent uniforms.
+- Reduce CPU work on replay and shader lookup, prepare descriptor binding order once per shader program, and use restricted mip views to avoid redundant framebuffer copies in eligible passes.
+- Enable shared preparation and restricted mip views in all five VR presets. GPU overlap remains opt-in through `ODYSSEY_VR_OVERLAP_GPU=1`.
+- In the controlled 4× forest A/B, shared preparation reduced average stereo replay and handoff from 9.50 ms to 9.37 ms and the 95th percentile from 14.63 ms to 14.13 ms. The forest still misses 90 FPS in heavy views. A physical 90 Hz head-turn check for this release is pending.
+- Existing v0.2.11 game libraries can be used directly.
+
 ## v0.2.11
 
 - Enable native headset-refresh rendering in the 4×, 6×, 8×, 9× and 10× launchers. Supported gameplay scenes render extra stereo pairs between 60 Hz gameplay ticks. Each pair uses the head pose captured for that scene draw.

@@ -23,6 +23,10 @@ In headset testing at 4× and 90 Hz, the owner reported smooth head turns and 60
 
 The stage draw preparation and skeletal sampling adapt the MIT-licensed work in [Super Odyssey PC Recomp](https://github.com/Simon3Sarkis/super-odyssey-pc-recomp/blob/052d390f4e741aa7ae964bd8de3e4520f6c8ca9e/runtime/hle/odyssey_120.c).
 
+Since v0.2.12, all five presets share pipeline preparation and frame-owned uniform uploads between eyes and avoid redundant texture copies for eligible mip passes. A 4× forest benchmark showed a modest improvement in stereo replay and handoff. Heavy views still exceed the 11.1 ms frame budget for 90 Hz. The physical 90 Hz headset check for these changes is pending.
+
+To try GPU overlap at any preset, open Command Prompt in the install folder, run `set ODYSSEY_VR_OVERLAP_GPU=1` and then run the usual launcher from that same prompt. This option lets CPU translation start on the next frame while the GPU finishes the previous stereo pair.
+
 ## Controls
 
 | Control | Action |
