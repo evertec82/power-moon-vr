@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.13
+
+- Replace per-draw `vkUpdateDescriptorSets` calls with Vulkan 1.1 `VkDescriptorUpdateTemplate` updates, reuse eye-independent vertex and fragment descriptor sets (`vset`/`fset`), resolved index/vertex buffers, feedback checks, and VR pass classifications from Eye 0 to Eye 1, compact `PipeKey`, and cache `rscale` uniform uploads.
+- Add guarded native-pass culling (`ODYSSEY_VR_SKIP_NATIVE_SCENE=1`) to skip redundant mono GPU recording for scalable scene targets and non-shared depth shadow passes once both eyes have active history, while preserving full replay logging and using Eye 0 for the desktop mirror.
+- Eliminate redundant `occ_keys` hashing and immutable uniform `memcmp` overhead during serial VR logging, and fix `pass_color` zeroing on depth-only passes.
+- Enable `ODYSSEY_VR_SKIP_NATIVE_SCENE=1` and `ODYSSEY_VR_OVERLAP_GPU=1` alongside `ODYSSEY_VR_PREPARE_DRAWS=1` and `ODYSSEY_VK_FEEDBACK_MIPS=1` in all five VR presets.
+- In the 4× Wooded Kingdom forest benchmark (3840×2160, 90 Hz target), stereo replay and handoff improved from 9.37 ms/pair to 4.04 ms/pair (~6.71 ms total CPU + handoff per frame), delivering 1,029 / 1,030 stereo pairs (89.9–90.2 FPS) with zero draw, uniform, or state mismatches.
+- Existing v0.2.11 / v0.2.12 game libraries can be used directly.
+
 ## v0.2.12
 
 - Share decoded graphics pipeline state and uploads of frame-owned uniforms between the two eye renders. Each eye still resolves its own attachments and camera-dependent uniforms.

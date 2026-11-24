@@ -23,9 +23,9 @@ In headset testing at 4× and 90 Hz, the owner reported smooth head turns and 60
 
 The stage draw preparation and skeletal sampling adapt the MIT-licensed work in [Super Odyssey PC Recomp](https://github.com/Simon3Sarkis/super-odyssey-pc-recomp/blob/052d390f4e741aa7ae964bd8de3e4520f6c8ca9e/runtime/hle/odyssey_120.c).
 
-Since v0.2.12, all five presets share pipeline preparation and frame-owned uniform uploads between eyes and avoid redundant texture copies for eligible mip passes. A 4× forest benchmark showed a modest improvement in stereo replay and handoff. Heavy views still exceed the 11.1 ms frame budget for 90 Hz. The physical 90 Hz headset check for these changes is pending.
+Since v0.2.13, all five presets use Vulkan descriptor update templates, reuse eye-independent descriptor sets and vertex/index buffer lookups between eyes, skip redundant mono GPU work for scalable scene and non-shared shadow passes once eye history is active (`ODYSSEY_VR_SKIP_NATIVE_SCENE=1`), and enable GPU overlap (`ODYSSEY_VR_OVERLAP_GPU=1`) by default. In the 4× Wooded Kingdom forest benchmark (3840×2160, 90 Hz target), this reduced stereo replay and handoff from 9.37 ms/pair to 4.04 ms/pair (~6.71 ms total per frame), holding 90 FPS (1,029 / 1,030 pairs delivered).
 
-To try GPU overlap at any preset, open Command Prompt in the install folder, run `set ODYSSEY_VR_OVERLAP_GPU=1` and then run the usual launcher from that same prompt. This option lets CPU translation start on the next frame while the GPU finishes the previous stereo pair.
+Since v0.2.12, all five presets share pipeline preparation and frame-owned uniform uploads between eyes and avoid redundant texture copies for eligible mip passes.
 
 ## Controls
 
