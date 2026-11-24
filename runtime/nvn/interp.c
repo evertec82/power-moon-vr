@@ -525,13 +525,24 @@ void interp_replay_unlock(void) { pthread_mutex_unlock(&free_lock); }
 #define DBITS 12
 static struct { uint64_t addr; uint32_t size, off, gen; } dd[1 << DBITS];
 static uint32_t dd_gen;
+void interp_cbuf_flush(void) { dd_gen++; }
+
+static bool interp_skip_occ(void) {
+#ifndef __APPLE__
+    extern bool vr_enabled(void);
+    extern bool vr_multiple_samples(void);
+    return vr_enabled() && !vr_multiple_samples();
+#else
+    return false;
+#endif
+}
 
 bool interp_list_submitted(uint64_t handle) {
     if (!g_interp_log || g_interp_replaying || !lg) return false;
     bool first = !frame_open;
     if (first) {
         frame_open = true;
-        memset(occ_keys, 0, sizeof occ_keys);
+        if (!interp_skip_occ()) memset(occ_keys, 0, sizeof occ_keys);
         lg->free_gen = atomic_load(&free_gen);
         dd_gen++;
     }
@@ -593,7 +604,7 @@ bool interp_draw(uint64_t key, bool depth_only) {
     GROW(lg->draws, lg->ndraws, lg->cap_draws, 1024);
     DrawRec *d = &lg->draws[lg->ndraws++];
     d->key = key;
-    d->occ = next_occ(key);
+    d->occ = interp_skip_occ() ? 0 : next_occ(key);
     d->depth_only = depth_only;
     d->screen_pass = 0;
     d->first_cb = lg->ncbs;
@@ -609,6 +620,13 @@ const void *interp_cbuf_peek(int stage, int slot, const void *fallback, uint64_t
         if(c->stage==stage && c->slot==slot) { *size=c->size; return c->blend>=0?blend_bytes+c->blend:cur->bytes+c->off; }
     }
     return fallback;
+}
+
+void interp_skip_stage(int stage) {
+    if (!g_interp_replaying || rp_cur < 0) return;
+    DrawRec *d = &cur->draws[rp_cur];
+    uint32_t end = d->first_cb + d->ncb;
+    while (rp_cb < end && (cur->cbs[rp_cb].stage == stage || cur->cbs[rp_cb].stage == stage + 2)) rp_cb++;
 }
 
 const void *interp_cbuf(int stage, int k, int slot, const void *src, uint64_t size, uint64_t used) {
@@ -652,7 +670,7 @@ const void *interp_cbuf(int stage, int k, int slot, const void *src, uint64_t si
     d->ncb++;
     uint32_t h = (uint32_t)(((uint64_t)(uintptr_t)src * 0x9E3779B97F4A7C15ull ^ size) >> (64 - DBITS));
     if (dd[h].gen == dd_gen && dd[h].addr == (uint64_t)(uintptr_t)src && dd[h].size == size &&
-        !memcmp(lg->bytes + dd[h].off, src, size)) {
+        (stage < 2 || !memcmp(lg->bytes + dd[h].off, src, size))) {
         c->off = dd[h].off;  // (the same bytes as logged for an earlier draw: shared)
         return src;
     }

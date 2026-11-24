@@ -17,6 +17,8 @@ bool interp_list_submitted(uint64_t handle);  // true for the frame's first list
 bool interp_draw(uint64_t key, bool depth_only);  // false: a replayed draw without its record - leave it out  // depth_only: no colour target (a shadow pass)
 // Inspect a recorded uniform without advancing the replay cursor (VR layout classification).
 const void *interp_cbuf_peek(int stage, int slot, const void *fallback, uint64_t *size);
+void interp_skip_stage(int stage);
+void interp_cbuf_flush(void);
 const void *interp_cbuf(int stage, int k, int slot, const void *src, uint64_t size, uint64_t used);  // used: bytes the shader reads
 // The texture-pool entry a draw's texture i resolves to: logged with the frame (a replay takes the logged one - the
 // pool is the game's memory and it rewrites entries while the replays run; an area's lighting texture swapped under

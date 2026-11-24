@@ -850,7 +850,7 @@ static NvnTexture *vr_redirect(NvnTexture *t, bool write, int eye) {
     if(stable_start) seed=vr_frame_start(v,seed,eye,history);
     TexBackend *src = tex_backend(seed), *dst = tex_backend(v->eye[eye]);
     dst->gpu_owned = true;
-    if (!t->carry && tex_scalable(t)) {
+    if (!t->carry && (tex_scalable(t) || (renderer_format_is_depth(t->format) && t->target == 1 && t->width == t->height && !vk_vr_share_shadow(t)))) {
         if(vr_load_clear_scope && vk_vr_load_clear_enabled()) v->clear_generation[eye]=twin_gen;
         else {
         vk_end_pass();
@@ -914,6 +914,36 @@ bool vk_vr_skip_shadow_write(NvnTexture *t) {
     if(!vk_vr_share_shadow(t))return false;
     t->vr_shadow_write_gen=twin_gen;
     return true;
+}
+bool vk_tex_is_eye_local(NvnTexture *t) {
+    if (!t) return false;
+    if (*vr_image_slot(t) != NULL || t->carry) return true;
+    return t->wr_epoch == replay_epoch && !vk_vr_share_shadow(t);
+}
+static bool vr_shadow_cullable_depth(NvnTexture *t) {
+    static int share_on = -1;
+    if (share_on < 0) { const char *e = getenv("ODYSSEY_VR_SHARE_SHADOWS"); share_on = e ? atoi(e) : 0; }
+    if (share_on || vr_shadow_override > 0) return false;
+    return t && !t->carry && t->target == 1 && t->samples <= 1 && t->width == t->height && t->width >= 128 &&
+           renderer_format_is_depth(t->format);
+}
+bool vk_tex_vr_cullable(NvnTexture *t) {
+    if (!t || (!tex_scalable(t) && !vr_shadow_cullable_depth(t))) return false;
+    VrImages *v = *vr_image_slot(t);
+    return v && v->eye[0] && v->eye[0]->backend && v->eye[1] && v->eye[1]->backend &&
+           v->history_generation[0] == vr_history_generation &&
+           v->history_generation[1] == vr_history_generation;
+}
+void vk_tex_frame_access_culled(NvnTexture *t, bool write) {
+    if (!t || !g_interp_log || g_twin_redirect) return;
+    vr_shadow_access(&t->vr_access, g_tex_epoch, write);
+    if (!write) {
+        if (t->wr_epoch != g_tex_epoch) t->rd_epoch = g_tex_epoch;
+        return;
+    }
+    if (t->wr_epoch == g_tex_epoch) return;
+    t->wr_epoch = g_tex_epoch;
+    if (t->rd_epoch == g_tex_epoch) t->carry = true;
 }
 static NvnTexture *replay_redirect(NvnTexture *t, bool for_render) {
     int eye = vr_eye_index();

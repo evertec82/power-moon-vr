@@ -244,7 +244,24 @@ static bool vr_overlap_gpu(void) {
     return enabled;
 }
 static bool capture_requested,eye_history_active;
+static TexBackend *mirror_eye_image;
 void vr_request_capture(void) { capture_requested=true; }
+TexBackend *vr_mirror_image(void) { return mirror_eye_image; }
+bool vr_native_scene_cull_active(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *e = getenv("ODYSSEY_VR_SKIP_NATIVE_SCENE");
+        enabled = e && atoi(e) != 0;
+        if (enabled) LOG("[vr] native mono scalable scene draw culling enabled\n");
+    }
+    if (!enabled || !vr_enabled() || !eye_history_active || frame_title_menu || capture_requested) return false;
+    if (offscreen_check && !getenv("ODYSSEY_VR_BENCH_NO_CAPTURE")) {
+        extern uint64_t renderer_present_count(void);
+        unsigned long at = strtoul(getenv("ODYSSEY_VR_OFFSCREEN_CHECK"), NULL, 10);
+        if (renderer_present_count() + 4 >= at) return false;
+    }
+    return true;
+}
 static float scale = 100;
 static pthread_mutex_t camera_lock=PTHREAD_MUTEX_INITIALIZER;
 static struct { float fovy,aspect,nearz,farz; bool valid; } game_camera;
@@ -1144,6 +1161,7 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
             cost_add(C_REPLAY,replay_at);
             extern TexBackend *vk_tex_replayed(NvnTexture *t);
             TexBackend *eye_image=vk_tex_replayed(texture);
+            if (i == 0 && eye_image && !frame_title_menu) mirror_eye_image = eye_image;
             extern bool g_debug_frame;
             extern void renderer_save_texture_tex(TexBackend *b,const char *path);
             if(capture_requested) {
@@ -1228,6 +1246,7 @@ done:
         extern void vk_vr_history_reset(void);
         vk_vr_history_reset();
     }
+    if (!completed || frame_title_menu) mirror_eye_image = NULL;
     eye_history_active=completed;
     eye=-1;
     interp_frame_rotate(keep_history);

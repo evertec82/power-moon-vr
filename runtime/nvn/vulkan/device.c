@@ -1314,9 +1314,11 @@ static void backend_present_locked(NvnTexture *t, bool handed) {
         }
     }
     if (have) {
+        extern TexBackend *vr_mirror_image(void);
+        TexBackend *present_b = (vr_enabled() && vr_mirror_image()) ? vr_mirror_image() : b;
         VkCommandBuffer cb = vk_cmd();
-        vk_checkpoint(cb, "present draw %p %ux%u -> window %.0fx%.0f", (void *)b->image, b->width, b->height, v[2], v[3]);
-        vk_present_draw(cb, b, v[0], v[1], v[2], v[3], pv);
+        vk_checkpoint(cb, "present draw %p %ux%u -> window %.0fx%.0f", (void *)present_b->image, present_b->width, present_b->height, v[2], v[3]);
+        vk_present_draw(cb, present_b, v[0], v[1], v[2], v[3], pv);
         vk_checkpoint(cb, "menu overlay");
         vk_queue_lock();  // (ImGui's first frame uploads its fonts through the queue)
         menu_render((void *)cb, g_vk.sc_extent.width, g_vk.sc_extent.height);

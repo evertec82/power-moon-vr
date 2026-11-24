@@ -135,6 +135,9 @@ void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h);
 bool vk_vr_share_shadow(NvnTexture *t);
 void vk_vr_shadow_override(int on); // offscreen same-frame comparison only; -1 restores environment
 bool vk_vr_skip_shadow_write(NvnTexture *t);
+bool vk_tex_is_eye_local(NvnTexture *t);
+bool vk_tex_vr_cullable(NvnTexture *t);
+void vk_tex_frame_access_culled(NvnTexture *t, bool write);
 
 // Optional folding of full-image eye initialization into attachment load ops.
 void vk_vr_load_clear_scope(bool eligible);
