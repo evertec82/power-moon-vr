@@ -644,6 +644,24 @@ VkSpan vk_transient_copy(const void *data, uint64_t size, uint64_t align) {
 // Per-draw constants that usually repeat the previous draw's (scale table, tint, driver constants): reuse that copy
 // while it's identical, within one submission. slot: one per kind of data.
 enum { DEDUPE_RSCALE_V, DEDUPE_RSCALE_F, DEDUPE_TINT, DEDUPE_DRV_V, DEDUPE_DRV_F, DEDUPE_DRV_C, DEDUPE_SLOTS };
+static uint64_t hash_words(uint64_t h, const void *p, size_t n);
+static VkSpan rscale_copy(const float rs_head[][4], uint32_t rows) {
+    enum { RSCALE_CACHE = 16 };
+    static struct { uint64_t seq, hash; uint32_t rows; VkSpan span; float head[65][4]; } cache[RSCALE_CACHE];
+    uint64_t seq = vk_pending_seq();
+    uint32_t bytes = rows * 16;
+    uint64_t h = hash_words(0xcbf29ce484222325ull ^ rows, rs_head, bytes);
+    uint32_t slot = (uint32_t)(h ^ (h >> 32)) & (RSCALE_CACHE - 1);
+    __typeof__(*cache) *c = &cache[slot];
+    if (c->seq == seq && c->hash == h && c->rows == rows && !memcmp(c->head, rs_head, bytes)) return c->span;
+    VkSpan s = vk_transient(66 * 16, 256);
+    memcpy(s.ptr, rs_head, bytes);
+    memset((uint8_t *)s.ptr + bytes, 0, 66 * 16 - bytes);
+    c->seq = seq; c->hash = h; c->rows = rows; c->span = s;
+    memcpy(c->head, rs_head, bytes);
+    return s;
+}
+
 static VkSpan copy_dedupe(int slot, const void *data, uint64_t size, uint64_t align) {
     static struct { uint64_t seq, size; uint8_t data[0x800]; VkSpan span; } last[DEDUPE_SLOTS];
     uint64_t seq = vk_pending_seq();
@@ -2550,13 +2568,16 @@ static int rt_kind(uint32_t f) {
 typedef struct {
     Prog *prog;
     VkFormat color[8], depth, stencil;
-    uint32_t ncolor, samples;
-    uint32_t attr_fmt[32], attr_off[32], attr_bind[32];
+    uint8_t ncolor, samples;
+    uint16_t attr_fmt[32];
+    uint32_t attr_off[32];
+    uint8_t attr_bind[32];
     uint32_t attr_mask;
-    uint32_t stride[17], divisor[17], used_streams;
+    uint16_t stride[17], divisor[17];
+    uint32_t used_streams;
     uint8_t blend[8][8];
     uint8_t blend_on, a2c, topo_class, poly_fill;
-    uint32_t write_mask[8];
+    uint8_t write_mask[8];
 } PipeKey;
 
 typedef struct { PipeKey k; uint64_t hash; VkPipeline pipe; _Atomic int state; } Pipe;  // state: 0 building, 1 ready, 2 failed
@@ -4235,7 +4256,8 @@ static void vc_mark_sbufs(int stage) {
     }
 }
 
-static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, int32_t *slot_out) {
+    if (slot_out) *slot_out = -1;
     if (vc_on < 0) {
         const char *e = getenv("ODYSSEY_VK_VCACHE");
         vc_on = !e || atoi(e) != 0;
@@ -4289,6 +4311,7 @@ static bool vcache_lookup(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceS
         vc_pend[vc_npend++] = (uint32_t)(e - vc_tab);
     }
     prof_vc_hits++;
+    if (slot_out) *slot_out = (int32_t)(e - vc_tab);
     *buf = e->buf;
     *off = addr - HEAP_BASE - lo;
     return true;
@@ -4347,13 +4370,14 @@ void vc_flush(void) {
 // device-local cache above, else read in place - no per-draw copy, no index scan for the copy size. The game fences its
 // CPU writes as on the Switch. Falls back to copies outside the heap or without the import; ODYSSEY_VK_COPY_VERTICES=1
 // forces copies.
-static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off) {
+static bool guest_direct(uint64_t addr, uint64_t size, VkBuffer *buf, VkDeviceSize *off, int32_t *vc_slot_out) {
+    if (vc_slot_out) *vc_slot_out = -1;
     static int copy = -1;
     if (copy < 0) copy = getenv("ODYSSEY_VK_COPY_VERTICES") != NULL;
     if (copy || addr < HEAP_BASE) return false;
     if (addr + size > HEAP_BASE + gmem_size && kernel_heap_size() != gmem_tried) { gmem_tried = kernel_heap_size(); gmem_info(); }
     if (!gmem_buf || addr + size > HEAP_BASE + gmem_size) return false;
-    if (vcache_lookup(addr, size, buf, off)) return true;
+    if (vcache_lookup(addr, size, buf, off, vc_slot_out)) return true;
     *buf = gmem_buf;
     *off = addr - HEAP_BASE;
     return true;
@@ -4477,12 +4501,26 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         if (b->binding == GMAP_BUFFER_INDEX) {  // (compute) this dispatch's fast-copy table: gfast_prepare
             data[i].buf = ubo_span(vk_transient_copy(gmap_tab, sizeof gmap_tab, 256), sizeof gmap_tab);
         } else if (b->binding == 18) {
-            float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
-            if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
-            rs[65][0] = g_mirror_w;
-            for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1];
-                if(sg==1){rs[1+t][2]=tex_screen_uv[t][0];rs[1+t][3]=tex_screen_uv[t][1];} }
-            data[i].buf = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+            if (g_mirror_w == 0.0f) {
+                uint32_t ntex = si->ntex < 64 ? (uint32_t)si->ntex : 64;
+                float rs_head[65][4];
+                if (rscale_row0) memcpy(rs_head[0], rscale_row0, 16);
+                else { rs_head[0][0] = 1; rs_head[0][1] = 1; rs_head[0][2] = 0; rs_head[0][3] = 0; }
+                for (uint32_t t = 0; t < ntex; t++) {
+                    rs_head[1 + t][0] = tex_sc[sg][t][0];
+                    rs_head[1 + t][1] = tex_sc[sg][t][1];
+                    rs_head[1 + t][2] = sg == 1 ? tex_screen_uv[t][0] : 0;
+                    rs_head[1 + t][3] = sg == 1 ? tex_screen_uv[t][1] : 0;
+                }
+                data[i].buf = ubo_span(rscale_copy(rs_head, 1 + ntex), 66 * 16);
+            } else {
+                float rs[66][4] = {{1, 1, 0, 0}};  // ([65]: mirror mode, renderer.m)
+                if (rscale_row0) memcpy(rs[0], rscale_row0, 16);
+                rs[65][0] = g_mirror_w;
+                for (int t = 0; t < si->ntex && t < 64; t++) { rs[1 + t][0] = tex_sc[sg][t][0]; rs[1 + t][1] = tex_sc[sg][t][1];
+                    if(sg==1){rs[1+t][2]=tex_screen_uv[t][0];rs[1+t][3]=tex_screen_uv[t][1];} }
+                data[i].buf = ubo_span(copy_dedupe(sg ? DEDUPE_RSCALE_F : DEDUPE_RSCALE_V, rs, sizeof rs, 256), sizeof rs);
+            }
         } else {
             float zero[8] = {0};
             data[i].buf = ubo_span(copy_dedupe(DEDUPE_TINT, tint ? tint : zero, 32, 256), 32);
@@ -4735,10 +4773,21 @@ typedef struct {
     const CmdRec *command;
     VkPrimitiveTopology topology;
     uint8_t topology_class, color_mask, blend_mask;
+    uint8_t no_feedback, vr_classified, vr_kind, vr_screen_shadow, hud_panel, ib_direct;
     bool native;
     Pipe *pipeline;
     VkDescriptorSet vset, fset;
     float f_rs0[4];
+    float ui_scale;
+    VkIndexType ib_type;
+    uint32_t ib_count;
+    VkBuffer ib_buf;
+    VkDeviceSize ib_off;
+    int32_t ib_vc_slot;
+    uint16_t vb_direct_mask;
+    VkBuffer vb_buf[16];
+    VkDeviceSize vb_off[16];
+    int32_t vb_vc_slot[16];
     uint32_t attrib_kinds[4];
     const CmdRec *attrib_binding, *stream_binding;
     uint32_t channel_mask;
@@ -4771,6 +4820,10 @@ static PreparedDraw *draw_preparation(const CmdRec *command) {
         d->pipeline = NULL;
         d->vset = VK_NULL_HANDLE;
         d->fset = VK_NULL_HANDLE;
+        d->no_feedback = 0;
+        d->vr_classified = 0;
+        d->ib_direct = 0;
+        d->vb_direct_mask = 0;
         return d;
     }
     return i < prepared_count && d->command == command ? d : NULL;
@@ -5056,7 +5109,11 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     if (ct_on()) ct_draw(pr, "draw");
     alias_draw_check();
-    resolve_feedback(pr);
+    if (!(prepared && preparing_eye == 1 && prepared->pipeline && prepared->no_feedback && nfeedback == 0)) {
+        bool had_fb = nfeedback != 0;
+        resolve_feedback(pr);
+        if (prepared && preparing_eye == 0) prepared->no_feedback = (!had_fb && nfeedback == 0);
+    }
     snap_reason = "draw-depthwrite";
     if (st.rt.depth && st.ds[0] && st.ds[1]) snapshots_invalidate(st.rt.depth);
     snap_reason = "draw-colorwrite";
@@ -5105,9 +5162,18 @@ static void draw_(CmdRec *r, bool indexed) {
         float eye_matrix[16] = {1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1};
         extern int vr_eye_index(void);
         if(vr_eye_index()>=0) {
+        int kind;
+        if (prepared && preparing_eye == 1 && pipe_matched && prepared->vr_classified) {
+            kind = prepared->vr_kind;
+            vr_screen_shadow = prepared->vr_screen_shadow != 0;
+            if (vr_screen_shadow) vr_screen_shadow_source = st.rt.ncolor ? st.rt.color[0] : NULL;
+            vr_geometry_pass = kind == VR_PASS_WORLD;
+            hud_panel = prepared->hud_panel != 0;
+            ui_scale = prepared->ui_scale;
+        } else {
         NvnTexture *depth = st.ds[0] ? st.rt.depth : NULL;
         bool reads_ui = (pr->vi->cbuf_mask & 8) && pr->vi->cbuf_size[3] >= 512 && st.ubuf[0][0].size == 560;
-        int kind = vr_classify_pass(pr->vi->cbuf_mask, pr->vi->cbuf_size[3], st.ubuf[0][0].size,
+        kind = vr_classify_pass(pr->vi->cbuf_mask, pr->vi->cbuf_size[3], st.ubuf[0][0].size,
             reads_ui && ui2d_covers_screen((const float *)(uintptr_t)st.ubuf[0][0].addr, st.ubuf[0][0].size),
             r->x[2], st.rt.depth && st.ds[0] ? pr->vi->attr_mask : 0, depth ? depth->width : 0, depth ? depth->height : 0);
         if(pr->fi->ntex) {
@@ -5143,6 +5209,14 @@ static void draw_(CmdRec *r, bool indexed) {
             extern bool vr_hud_camera_fixed(void);
             hud_panel=vr_hud_camera_fixed();
             if(!hud_panel)ui_scale=vr_ui_scale();
+        }
+        if (prepared && preparing_eye == 0) {
+            prepared->vr_kind = (uint8_t)kind;
+            prepared->vr_screen_shadow = vr_screen_shadow ? 1 : 0;
+            prepared->hud_panel = hud_panel ? 1 : 0;
+            prepared->ui_scale = ui_scale;
+            prepared->vr_classified = 1;
+        }
         }
         if (kind == VR_PASS_WORLD || hud_panel)
             vr_clip_matrix(eye_matrix, kind == VR_PASS_WORLD, vkey.flip_y, vkey.depth_minus_one,
@@ -5430,9 +5504,28 @@ static void draw_(CmdRec *r, bool indexed) {
             uint32_t isz = itype == 1 ? 2 : 4;
             itype_vk = itype == 1 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
             icount = count;
-            if (iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off)) {
+            int32_t ib_slot = -1;
+            bool ib_reused = false;
+            if (prepared && preparing_eye == 1 && pipe_matched && prepared->ib_direct) {
+                int32_t sl = prepared->ib_vc_slot;
+                if (sl < 0 || (sl < VC_TAB && vc_tab[sl].buf == prepared->ib_buf)) {
+                    if (sl >= 0) vc_tab[sl].used_seq = vk_pending_seq();
+                    ib.buf = prepared->ib_buf; ib.off = prepared->ib_off;
+                    scan_src = src; scan_isz = isz; scan_restart = restart;
+                    ib_reused = true;
+                }
+            }
+            if (!ib_reused && iaddr % isz == 0 && guest_direct(iaddr, (uint64_t)count * isz, &ib.buf, &ib.off, &ib_slot)) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
-            } else {
+                if (prepared && preparing_eye == 0) {
+                    prepared->ib_direct = 1;
+                    prepared->ib_type = itype_vk;
+                    prepared->ib_count = icount;
+                    prepared->ib_buf = ib.buf;
+                    prepared->ib_off = ib.off;
+                    prepared->ib_vc_slot = ib_slot;
+                }
+            } else if (!ib_reused) {
                 ib = vk_transient_copy(src, (uint64_t)count * isz + 4, 4);
                 if (isz == 2) { const uint16_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != (uint16_t)restart) max_index = s[i]; }
                 else { const uint32_t *s = src; for (uint32_t i = 0; i < count; i++) if (s[i] > max_index && s[i] != restart) max_index = s[i]; }
@@ -5471,7 +5564,25 @@ static void draw_(CmdRec *r, bool indexed) {
             Range v = st.vbuf[s];
             VkBuffer dbuf;
             VkDeviceSize doff;
-            if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff)) {
+            if (prepared && preparing_eye == 1 && pipe_matched && ((prepared->vb_direct_mask >> s) & 1)) {
+                int32_t sl = prepared->vb_vc_slot[s];
+                if (sl < 0 || (sl < VC_TAB && vc_tab[sl].buf == prepared->vb_buf[s])) {
+                    if (sl >= 0) vc_tab[sl].used_seq = vk_pending_seq();
+                    dbuf = prepared->vb_buf[s]; doff = prepared->vb_off[s];
+                    if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
+                    ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
+                    vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                    continue;
+                }
+            }
+            int32_t vb_slot = -1;
+            if (v.addr && v.size && guest_direct(v.addr, v.size, &dbuf, &doff, &vb_slot)) {
+                if (prepared && preparing_eye == 0) {
+                    prepared->vb_direct_mask |= (uint16_t)(1u << s);
+                    prepared->vb_buf[s] = dbuf;
+                    prepared->vb_off[s] = doff;
+                    prepared->vb_vc_slot[s] = vb_slot;
+                }
                 if (ss_on && (ss.vb_known >> s & 1) && ss.vb[s] == dbuf && ss.vo[s] == doff) continue;
                 ss.vb[s] = dbuf; ss.vo[s] = doff; ss.vb_known |= 1u << s;
                 vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
