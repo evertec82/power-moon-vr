@@ -243,10 +243,11 @@ static bool vr_overlap_gpu(void) {
     }
     return enabled;
 }
-static bool capture_requested,eye_history_active;
+static bool capture_requested,eye_history_active,vr_gameplay_seen;
 static TexBackend *mirror_eye_image;
 void vr_request_capture(void) { capture_requested=true; }
 TexBackend *vr_mirror_image(void) { return mirror_eye_image; }
+void vr_mirror_forget(TexBackend *b) { if (b && mirror_eye_image == b) mirror_eye_image = NULL; }
 bool vr_native_scene_cull_active(void) {
     static int enabled = -1;
     if (enabled < 0) {
@@ -254,7 +255,7 @@ bool vr_native_scene_cull_active(void) {
         enabled = e && atoi(e) != 0;
         if (enabled) LOG("[vr] native mono scalable scene draw culling enabled\n");
     }
-    if (!enabled || !vr_enabled() || !eye_history_active || frame_title_menu || capture_requested) return false;
+    if (!enabled || !vr_enabled() || !vr_gameplay_seen || frame_title_menu || capture_requested) return false;
     if (offscreen_check && !getenv("ODYSSEY_VR_BENCH_NO_CAPTURE")) {
         extern uint64_t renderer_present_count(void);
         unsigned long at = strtoul(getenv("ODYSSEY_VR_OFFSCREEN_CHECK"), NULL, 10);
@@ -802,12 +803,7 @@ static bool copy_eye(TexBackend *src,int i,uint32_t idx) {
 
 bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t deadline) {
     if(!frame) return false;
-    // Wait before using the eye targets again. The next native draw list
-    // can already have been translated by this point. The render owner still
-    // submits both eyes and the original pose in order on the same queue.
     static uint64_t previous_pair;
-    vr_wait_pair(previous_pair);
-    previous_pair = 0;
     if(!offscreen_check&&vr_enabled()&&session){poll_events();vr_input_poll(session,focused);}
     static unsigned consecutive_skips;
     static uint64_t skipped;
@@ -916,6 +912,9 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
                 if(prepare_ab) vk_vr_prepare_override(bench_variant);
                 else vk_vr_load_clear_override(bench_variant);
             }
+            // Wait for any overlapped previous stereo pair before writing eye targets again.
+            vr_wait_pair(previous_pair);
+            previous_pair = 0;
             uint64_t bench_at=SDL_GetTicksNS(),bench_cpu=0;
             extern void renderer_save_texture_tex(TexBackend *,const char *);
             extern TexBackend *vk_tex_replayed(NvnTexture *);
@@ -1139,6 +1138,9 @@ bool vr_frame(InterpFrame *frame,NvnTexture *texture,uint32_t epoch,uint64_t dea
     }
     bool acquired[2]={false,false};
     uint64_t pair_seq=0;
+    // Retire the previous overlapped stereo pair after pWaitFrame/pLocateViews
+    // and right before writing into the eye targets for this frame.
+    if (rendered) { vr_wait_pair(previous_pair); previous_pair = 0; }
     if(rendered) for(int i=0;i<(frame_title_menu?1:2);i++) {
         uint64_t acquire_at=SDL_GetTicksNS();
         uint32_t index;
@@ -1247,6 +1249,7 @@ done:
         vk_vr_history_reset();
     }
     if (!completed || frame_title_menu) mirror_eye_image = NULL;
+    if (completed && !frame_title_menu) vr_gameplay_seen = true;
     eye_history_active=completed;
     eye=-1;
     interp_frame_rotate(keep_history);

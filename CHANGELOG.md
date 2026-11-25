@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.14
+
+- Fix progressive stutter spirals in live VR sessions: only require valid eye history for `carry` targets when culling redundant native mono passes, and keep native-pass culling active after a single skipped frame instead of falling back to full mono rendering on the next frame.
+- Move the `ODYSSEY_VR_OVERLAP_GPU=1` wait (`vr_wait_pair`) after the late-frame debt check and OpenXR `xrWaitFrame`/`xrBeginFrame`/`xrLocateViews` calls so previous-pair GPU completion overlaps with frame pacing and does not falsely trigger frame skips on slower GPUs or higher presets.
+- Clear the cached desktop mirror image pointer (`vr_mirror_forget`) when Eye 0's texture is destroyed across dynamic-resolution or stage transitions.
+- Existing v0.2.11 / v0.2.12 / v0.2.13 game libraries can be used directly.
+
 ## v0.2.13
 
 - Replace per-draw `vkUpdateDescriptorSets` calls with Vulkan 1.1 `VkDescriptorUpdateTemplate` updates, reuse eye-independent vertex and fragment descriptor sets (`vset`/`fset`), resolved index/vertex buffers, feedback checks, and VR pass classifications from Eye 0 to Eye 1, compact `PipeKey`, and cache `rscale` uniform uploads.

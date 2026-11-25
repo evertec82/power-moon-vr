@@ -458,6 +458,8 @@ void backend_texture_destroyed(NvnTexture *t) {
     twin_forget(t);
     TexBackend *b = t->backend;
     if (b) {
+        extern void vr_mirror_forget(TexBackend *b);
+        vr_mirror_forget(b);
         extern void vk_alias_texture_destroyed(NvnTexture *t);  // (exec.c copy aliases: a source's contents handed over)
         vk_alias_texture_destroyed(t);
         live_remove(b);
@@ -930,8 +932,9 @@ static bool vr_shadow_cullable_depth(NvnTexture *t) {
 bool vk_tex_vr_cullable(NvnTexture *t) {
     if (!t || (!tex_scalable(t) && !vr_shadow_cullable_depth(t))) return false;
     VrImages *v = *vr_image_slot(t);
-    return v && v->eye[0] && v->eye[0]->backend && v->eye[1] && v->eye[1]->backend &&
-           v->history_generation[0] == vr_history_generation &&
+    if (!v || !v->eye[0] || !v->eye[0]->backend || !v->eye[1] || !v->eye[1]->backend) return false;
+    if (!t->carry) return true;
+    return v->history_generation[0] == vr_history_generation &&
            v->history_generation[1] == vr_history_generation;
 }
 void vk_tex_frame_access_culled(NvnTexture *t, bool write) {
